@@ -299,7 +299,6 @@ the gateway's own error, in the gateway's own words.
 
 The relay listens on `127.0.0.1` by default, so it serves this machine (every
 local agent). To serve the network:
-
 ```bash
 SAJILO_RELAY_BIND=0.0.0.0 SAJILO_RELAY_TOKEN=$(openssl rand -hex 16) sajilo relay
 ```
@@ -313,7 +312,62 @@ Clients that speak the **Anthropic** shape (`/v1/messages`) need a translator
 in front: the relay is OpenAI-shaped only. Point them at the OpenAI endpoint
 through a converter, or use an agent that speaks OpenAI.
 
-## Platform matrix
+## Checking it is healthy
+
+```bash
+sajilo doctor
+```
+
+```
+instance
+  ok    home
+  ok    state
+  ok    relay plugin
+  ok    harness prompt
+  ok    harness tools
+
+harness spec
+  ok    sections intact (4/4)
+  ok    model block is a template (filled per request)
+  ok    identity: Sajilo
+  ok    12 tools in the spec
+
+runtime
+  ok    runtime: C:\Users\Arun\AppData\Roaming\npm\opencode.cmd
+
+relay
+  ok    listening on http://127.0.0.1:43914 (pid 19568, 0 requests served)
+  ok    mode: harness=sajilo tools=sajilo auth=open
+
+gateway
+  ok    harness accepted by the gateway (1.3s)
+  ok    model replied: SAJILO OK
+
+identity
+  ok    provider: sajilo
+  ok    model: sajilo/deepseek-v4.1-flash-free
+
+all checks passed
+```
+
+The gateway probe matters most. The harness spec is a **contract with the
+gateway**: the system prompt has to keep the agent-class shape and the
+twelve-tool set has to be there. Break either and every request comes back
+`429` - which looks exactly like an empty quota window, so it is easy to
+misdiagnose. The doctor sends the instance's real harness upstream and tells
+you which of the two it is.
+
+## The harness spec is yours
+
+`plugin/resources/agent-prompt.txt` and `agent-tools.json` are copied into
+the instance on install - and then **never overwritten**. Reinstalling keeps
+your version and puts the new one next to it as `*.bak`, because a clobbered
+spec can silently break the harness.
+
+What you can change freely: the identity, the voice, the rules, the language
+policy, the model block. What you should not: the *shape* - the sections the
+gateway recognises (Harness, Communication, Working in codebases, Your Model)
+and the twelve tool names. `sajilo doctor` checks both.
 
 ## Platform matrix
 
