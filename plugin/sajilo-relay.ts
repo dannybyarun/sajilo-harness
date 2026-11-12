@@ -265,10 +265,14 @@ const callerStreamWants = new WeakMap<Request, boolean>()
 // Ten of them are text-capable chat models; nemotron-3.5-super-vl-free is
 // vision-first, so it stays last. minimax-m3.1-flash-free was missing from
 // the original hand-written list even though it is one of the free models.
+// The model Sajilo leads with. The harness asks for it by default, and the
+// relay falls back to it when a request carries no model at all.
+const DEFAULT_MODEL = "deepseek-v4.1-flash-free"
+
 const FREE_POOL_FALLBACK = [
+  DEFAULT_MODEL,
   "mimo-v2.6-flash-free",
   "glm-5.3-flash-free",
-  "deepseek-v4.1-flash-free",
   "longcat-2.5-free",
   "iceman-free",
   "inkling-2-small-free",
@@ -951,24 +955,26 @@ function startServer(): void {
           // truncated payload). Parsing it used to throw out of the handler
           // and answer with Bun's HTML error page; now the pool still
           // applies and the upstream gets to reject it with a real error.
-          let originModel = "mimo-v2.6-flash-free"
+          // The model the harness asked for. The runtime sends the model the
+          // user picked in the TUI (/model) - so THAT wins here, and the relay
+          // follows the harness automatically. Only when the request carries
+          // no model at all do the pin file and then the default apply.
+          let originModel: string | null = null
           try {
             const m = (JSON.parse(transformed) as { model?: string }).model
             if (typeof m === "string" && m) originModel = m
           } catch {
-            /* not JSON — keep the default model */
+            /* not JSON — fall through to the pin/default */
           }
-          // The harness owns the model choice. "sajilo model <name>" writes a
-          // pin file that the launcher also reads (it puts the model in the
-          // runtime config), and this relay honours it on every request - so
-          // changing the model in the harness changes what the relay sends
-          // upstream, with no restart. The pin is only a PREFERENCE: if the
-          // pinned model is drained the relay still falls back to the pool.
-          const pinned = modelPin()
-          if (pinned) {
-            originModel = pinned
+          if (!originModel) {
+            const pinned = modelPin()
+            originModel = pinned ?? DEFAULT_MODEL
             logActivity(
-              `[${new Date().toISOString()}] MODEL-PINNED ${pinned} (harness choice; pool rotation still available as fallback)`,
+              `[${new Date().toISOString()}] MODEL ${originModel} (no model in the request - using the ${pinned ? "pinned" : "default"} model)`,
+            )
+          } else {
+            logActivity(
+              `[${new Date().toISOString()}] MODEL ${originModel} (chosen by the harness)`,
             )
           }
           // A UI can offer a model picker whose choice never reaches the

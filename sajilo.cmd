@@ -53,16 +53,22 @@ if not exist "%ROOT%\mint" mkdir "%ROOT%\mint"
 REM --- the model the harness wants ------------------------------------------
 REM One pin file, read live by BOTH sides: "sajilo model <name>" writes it,
 REM the launcher puts it in the runtime config, and the relay honours the same
-REM file on every request. Change the model in the harness and the relay
-REM follows immediately - no restart, no second place to edit.
+REM file when a request carries no model. Change the model in the harness and
+REM the relay follows it.
 REM (Read BEFORE the environment block below: it exports MODEL_FILE.)
 set "MODEL_FILE=%STATE%\model.txt"
 set "MODEL_ID="
+set "MODEL_AUTO="
 if exist "%MODEL_FILE%" (
   for /f "usebackq delims=" %%M in ("%MODEL_FILE%") do set "MODEL_ID=%%M"
 )
+if /i "%MODEL_ID%"=="auto" (
+  set "MODEL_ID="
+  set "MODEL_AUTO=1"
+)
+if "%MODEL_ID%"=="" if not "%MODEL_AUTO%"=="1" set "MODEL_ID=deepseek-v4.1-flash-free"
 set "MODEL_JSON="
-if not "%MODEL_ID%"=="" set "MODEL_JSON=,"model":"opencode/%MODEL_ID%""
+if not "%MODEL_ID%"=="" set "MODEL_JSON=,"model":"sajilo/%MODEL_ID%""
 
 REM --- environment for the child only ---------------------------------------
 set "HOME=%HOME_DIR%"
@@ -85,11 +91,28 @@ set "OPENCODE_RELAY_PROXY="
 set "NO_PROXY=127.0.0.1,localhost,::1"
 set "no_proxy=127.0.0.1,localhost,::1"
 
+REM --- the TUI's own identity ------------------------------------------------
+REM The runtime draws its own product name in the window title and the splash
+REM banner. These CLI settings are injected inline (nothing to edit by hand):
+REM   terminal.title false -> the tab stops saying "OpenCode"
+REM   highlights false     -> no update dialog on start
+REM   mini.splash hide     -> no entry/exit splash banner
+REM The provider in the config above is what the TUI prints next to the model
+REM (Sajilo, not OpenCode).
+set "OPENCODE_CLI_CONFIG_CONTENT={"terminal":{"title":false},"highlights":false,"mini":{"splash":"hide"}}"
+
 REM --- point the runtime at the sajilo relay --------------------------------
+REM A provider of OUR OWN instead of the built-in "opencode" one: the TUI then
+REM shows Sajilo next to the model instead of OpenCode, and /model offers
+REM exactly the free pool the relay can serve.
+set "CFG=%HOME_DIR%\.config\opencode\opencode.json"
 if /i not "%~1"=="direct" (
-  >"%HOME_DIR%\.config\opencode\opencode.json" echo {"$schema":"https://opencode.ai/config.json"%MODEL_JSON%,"provider":{"opencode":{"options":{"baseURL":"http://127.0.0.1:%RELAY_PORT%/openai/v1"}}}}
+  >"%CFG%" echo {"$schema":"https://opencode.ai/config.json"%MODEL_JSON%,"provider":{"sajilo":{"npm":"@ai-sdk/openai-compatible","name":"Sajilo","options":{"baseURL":"http://127.0.0.1:%RELAY_PORT%/openai/v1"},"models":{
+  >>"%CFG%" echo "deepseek-v4.1-flash-free":{"name":"DeepSeek V4.1 Flash Free"},"glm-5.3-flash-free":{"name":"GLM 5.3 Flash Free"},"mimo-v2.6-flash-free":{"name":"MiMo v2.6 Flash Free"},"longcat-2.5-free":{"name":"LongCat 2.5"},
+  >>"%CFG%" echo "iceman-free":{"name":"Iceman"},"inkling-2-small-free":{"name":"Inkling 2 Small"},"beam-free":{"name":"Beam"},"flint-40b-free":{"name":"Flint 40B"},
+  >>"%CFG%" echo "nemotron-3.5-lightning-free":{"name":"Nemotron 3.5 Lightning"},"minimax-m3.1-flash-free":{"name":"MiniMax M3.1 Flash"},"nemotron-3.5-super-vl-free":{"name":"Nemotron 3.5 Super VL"}}}}}
 ) else (
-  if exist "%HOME_DIR%\.config\opencode\opencode.json" del /q "%HOME_DIR%\.config\opencode\opencode.json"
+  if exist "%CFG%" del /q "%CFG%"
 )
 
 if /i "%~1"=="status" (

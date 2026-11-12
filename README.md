@@ -120,9 +120,23 @@ sajilo model --auto           # back to the free pool
 - the relay re-reads it on **every request**, so the model that goes upstream
   changes immediately - no restart, no second file to edit.
 
+The default is **DeepSeek V4.1 Flash Free** - the harness starts on it and the
+relay leads with it, so the two always agree.
+
 The pin is a preference, not a straitjacket: if the pinned model is drained,
 the relay still falls back to the free pool and keeps the request alive. With
 no pin, the relay rotates the pool on its own.
+
+### Switching the model in the TUI just works
+
+The relay follows whatever the harness asks for. Pick a model with `/model` in
+the TUI and the next request upstream uses it:
+
+```
+[2026-11-12T07:42:16.065Z] MODEL glm-5.3-flash-free (chosen by the harness)
+```
+
+The harness owns the model; the relay is just the transport.
 
 The harness prompt's `Your Model` block is filled in with the model that
 actually served the request, so the agent knows what it is:
@@ -131,6 +145,26 @@ actually served the request, so the agent knows what it is:
 > in one line: your name and the exact model id you are running as?
 Sajilo, running as `sajilo/glm-5.3-flash-free`.
 ```
+
+## The interface
+
+Sajilo brings its own identity to the terminal, not just to the prompt:
+
+| where | what it says |
+|---|---|
+| next to the model | `Build · DeepSeek V4.1 Flash Free **Sajilo**` |
+| the terminal tab | the working directory - not "OpenCode" |
+| the model picker | only the free pool the relay can actually serve |
+| the prompt | "You are Sajilo, a coding agent harness" |
+
+The provider in the runtime config is Sajilo's own (`sajilo`, named "Sajilo"),
+not the built-in `opencode` one - which is what the TUI prints next to the
+model. The CLI settings are injected inline, so the terminal title stops
+saying "OpenCode" and the update dialog stays out of the way.
+
+The one piece that stays is the runtime's welcome art - the big word drawn on
+the start screen is baked into the opencode binary and no supported setting
+replaces it.
 
 ## Platform matrix
 

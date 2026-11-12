@@ -55,8 +55,18 @@ RESOURCES_DIR="$ROOT/resources"
 # the runtime config) and by the relay (for every upstream request).
 MODEL_FILE="$STATE/model.txt"
 MODEL_ID=""
+MODEL_AUTO=""
 if [ -f "$MODEL_FILE" ]; then
   MODEL_ID=$(head -n 1 "$MODEL_FILE" 2>/dev/null | tr -d '\r' || true)
+fi
+if [ "$MODEL_ID" = "auto" ]; then
+  MODEL_ID=""
+  MODEL_AUTO=1
+fi
+# No pin and no "auto" -> the default model. The relay leads with the same
+# one, so the harness and the relay always agree.
+if [ -z "$MODEL_ID" ] && [ -z "$MODEL_AUTO" ]; then
+  MODEL_ID="deepseek-v4.1-flash-free"
 fi
 
 mkdir -p "$HOME_DIR/.config/opencode" "$PLUGIN_DIR/resources" "$STATE" "$WORK" \
@@ -73,6 +83,16 @@ export SAJILO_RELAY_UPSTREAM_FILE="$STATE/relay-upstream.txt"
 export SAJILO_RELAY_DIRECT_EGRESS_FLAG="$STATE/direct-egress"
 export SAJILO_RELAY_RESCUE_LOG="$STATE/rescue.log"
 export SAJILO_RELAY_MODEL_FILE="$MODEL_FILE"
+
+# The TUI's own identity. The runtime draws its product name in the window
+# title and the splash banner; these CLI settings are injected inline
+# (nothing to edit by hand):
+#   terminal.title false -> the tab stops saying "OpenCode"
+#   highlights false     -> no update dialog on start
+#   mini.splash hide     -> no entry/exit splash banner
+# The provider in the config above is what the TUI prints next to the model
+# (Sajilo, not OpenCode).
+export OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false,"mini":{"splash":"hide"}}'
 export SAJILO_RELAY_ROTATOR="$ROOT/bin/warp-rotate.sh"
 export SAJILO_RELAY_WATCHDOG="$ROOT/bin/tunnel-watchdog.sh"
 export SAJILO_ROTATE_MARKER="$STATE/.rotate.inprogress"
@@ -133,19 +153,37 @@ use_relay() {
   mkdir -p "$HOME_DIR/.config/opencode" 2>/dev/null || true
   # The model the harness wants: one pin file, read live by BOTH sides.
   # "sajilo model <name>" writes it, this puts it in the runtime config, and
-  # the relay honours the same file on every request - so changing the model
-  # in the harness changes what the relay sends upstream, with no restart.
+  # the relay honours the same file when a request carries no model - so
+  # changing the model in the harness changes what the relay sends upstream.
   local model_json=""
   if [ -n "$MODEL_ID" ]; then
-    model_json=",\"model\":\"opencode/$MODEL_ID\""
+    model_json=",\"model\":\"sajilo/$MODEL_ID\""
   fi
+  # A provider of OUR OWN instead of the built-in "opencode" one: the TUI then
+  # shows Sajilo next to the model instead of OpenCode, and /model offers
+  # exactly the free pool the relay can serve.
   cat >"$HOME_DIR/.config/opencode/opencode.json" <<EOF
 {
   "\$schema": "https://opencode.ai/config.json"$model_json,
   "provider": {
-    "opencode": {
+    "sajilo": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Sajilo",
       "options": {
         "baseURL": "http://127.0.0.1:$RELAY_PORT/openai/v1"
+      },
+      "models": {
+        "deepseek-v4.1-flash-free": { "name": "DeepSeek V4.1 Flash Free" },
+        "glm-5.3-flash-free": { "name": "GLM 5.3 Flash Free" },
+        "mimo-v2.6-flash-free": { "name": "MiMo v2.6 Flash Free" },
+        "longcat-2.5-free": { "name": "LongCat 2.5" },
+        "iceman-free": { "name": "Iceman" },
+        "inkling-2-small-free": { "name": "Inkling 2 Small" },
+        "beam-free": { "name": "Beam" },
+        "flint-40b-free": { "name": "Flint 40B" },
+        "nemotron-3.5-lightning-free": { "name": "Nemotron 3.5 Lightning" },
+        "minimax-m3.1-flash-free": { "name": "MiniMax M3.1 Flash" },
+        "nemotron-3.5-super-vl-free": { "name": "Nemotron 3.5 Super VL" }
       }
     }
   }
