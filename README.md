@@ -447,6 +447,31 @@ MCP tools are *deferred* by the runtime (discovered on demand rather than sent
 upfront), so they never bloat the request - the relay needs no special
 handling for them.
 
+## What it logs
+
+Everything the relay decides, in `<root>/state/`:
+
+| file | what it holds |
+|---|---|
+| `relay-activity.log` | every decision: the model each request chose, every upstream status, every 429, every ladder move, every rescue, every harness capture, every config merge |
+| `relay-last-incoming.json` | the last request body exactly as the client sent it |
+| `relay-last-transformed.json` | the same body after the relay rewrote it into the agent class |
+| `relay-last-meta.txt` | pathname, model, and the size of both |
+| `rescue.log` | the rescue chain's transcript: what it rotated, what it minted |
+
+`sajilo doctor` reads them back and gives the summary:
+
+```
+rotation record
+  ok    17 upstream 200s, 225 model 429s, 0 ladder climbs, 4 rescues (last 400 log lines)
+  warn  models hitting 429 most: deepseek-v4.1-flash-free:31, mimo-v2.6-flash-free:29
+  ok    last success: 2026-11-12T18:24:00
+```
+
+That is usually the fastest way to answer "is it Sajilo or the quota?": if
+the models are 429ing one after another it is the allowance; if the harness
+probe fails while the models are fine it is the harness.
+
 ## Platform matrix
 
 | | Linux / macOS / WSL | Windows |

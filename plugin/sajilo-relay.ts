@@ -475,7 +475,7 @@ const callerStreamWants = new WeakMap<Request, boolean>()
 // the background so the next attempt picks up a fresh pair.
 // The free pool is not hand-picked: the gateway publishes the whole
 // catalogue at GET /inference/openai/v1/models (which is NOT behind the
-// whitelist — a bare curl gets it), and it lists exactly eleven free models.
+// whitelist Ã¢â‚¬â€ a bare curl gets it), and it lists exactly eleven free models.
 // Ten of them are text-capable chat models; nemotron-3.5-super-vl-free is
 // vision-first, so it stays last. minimax-m3.1-flash-free was missing from
 // the original hand-written list even though it is one of the free models.
@@ -537,7 +537,7 @@ function modelPin(): string | null {
     const m = readFileSync(f, "utf8").trim()
     if (m) return m
   } catch {
-    /* no pin file — the runtime's own choice is used */
+    /* no pin file Ã¢â‚¬â€ the runtime's own choice is used */
   }
   return null
 }
@@ -598,7 +598,7 @@ function mintPair(reason: string): void {
 }
 
 // Full rescue chain: the free-tier allowance is bound to BOTH legs of the
-// identity — the WARP egress (IP bucket, usque tunnel) and the opencode
+// identity Ã¢â‚¬â€ the WARP egress (IP bucket, usque tunnel) and the opencode
 // session<->project pair. Rotating only one leg often still 429s, so on real
 // throttling we do both, in order, in the background:
 //   1. warp-rotate.sh --restart-only  (restart the tunnel on the CURRENT
@@ -618,7 +618,7 @@ let lastRescueAt = 0
  * VERDICT.md: "does pair-mint alone recover from a drained bucket, or is the
  * egress leg load-bearing?"). Disable with
  *   SAJILO_RELAY_EGRESS_ROTATE=0   (env)
- *   /tmp/sajilo/relay-no-egress-rotate.txt  (file, live-reloadable — the
+ *   /tmp/sajilo/relay-no-egress-rotate.txt  (file, live-reloadable Ã¢â‚¬â€ the
  *                                              server process env can't be
  *                                              changed without a restart)
  */
@@ -652,58 +652,75 @@ function kickRescue(reason: string): boolean {
     : (env("RELAY_ROTATOR") ?? "/usr/local/lib/opencode-warp/warp-rotate.sh")
   const RESCUE_LOG =
     env("RELAY_RESCUE_LOG") ?? "/tmp/sajilo/rescue.log"
-  // The rescue script runs under bash on unix and cmd on windows.
-  const shell = isWindows ? "cmd.exe" : "bash"
-  const shellArgs = isWindows ? ["/c", script] : ["-c", script]
-  const script = isWindows
-    ? `@echo off\r\n` +
-      `echo --- rescue ${new Date().toISOString()} (${reason}) egress-rotate=${rotateEgress} --- >>"${RESCUE_LOG}"\r\n` +
-      (rotateEgress
-        ? // Windows: --rotate-only replaces the WARP registration (a new exit
-          // IP). There is no --restart-only in the Windows rotator.
-          `"${ROTATOR}" --rotate-only >>"${RESCUE_LOG}" 2>&1\r\n` +
-          `echo rotate rc=%errorlevel% >>"${RESCUE_LOG}"\r\n`
-        : `echo egress rotation SKIPPED (experiment mode: pair-mint only) >>"${RESCUE_LOG}"\r\n`) +
-      // Mint via the relay's own loopback endpoint (no python3 dependency).
-      `curl -s -m 180 -X POST http://127.0.0.1:${PORT}/relay-mint ` +
-      `-H "content-type: application/json" -d "{}" >>"${RESCUE_LOG}" 2>&1\r\n` +
-      `echo mint: %errorlevel% >>"${RESCUE_LOG}"\r\n`
-    : `echo "--- rescue ${new Date().toISOString()} (${reason}) egress-rotate=${rotateEgress} ---" >>${RESCUE_LOG}\n` +
-      (rotateEgress
-        ? // Restart FIRST, rotate second. The free bucket is keyed on the EXIT
-          // IP, not on the WARP account (measured 2026-11-11: the same
-          // account with a new exit IP recovered a drained model). A restart
-          // is cheap and keeps the working account; a re-enrollment is slow
-          // and can produce a brand-new account whose tunnel never comes up.
-          `${ROTATOR} --restart-only >>${RESCUE_LOG} 2>&1\n` +
-          `RC=$?\n` +
-          `echo "restart rc=$RC" >>${RESCUE_LOG}\n` +
-          `if [ "$RC" -ne 0 ]; then ${ROTATOR} --rotate-only >>${RESCUE_LOG} 2>&1; ` +
-          `echo "rotate rc=$?" >>${RESCUE_LOG}; fi\n`
-        : `echo "egress rotation SKIPPED (experiment mode: pair-mint only)" >>${RESCUE_LOG}\n`) +
-      // Mint via the relay's own loopback endpoint (no python3 dependency).
-      `curl -s -m 180 -X POST http://127.0.0.1:${PORT}/relay-mint ` +
-      `-H 'content-type: application/json' -d '{}' >>${RESCUE_LOG} 2>&1\n` +
-      `echo " mint: $?" >>${RESCUE_LOG}\n`
-  try {
-    const proc = Bun.spawn([shell, ...shellArgs], {
-      stdout: "ignore",
-      stderr: "ignore",
-      stdin: "ignore",
-    })
-    proc.unref()
-    proc.exited.then((rc) => {
-      rescueInFlight = false
-      logActivity(`[${new Date().toISOString()}] RESCUE finished rc=${rc} (${reason})`)
-    })
-    logActivity(
-      `[${new Date().toISOString()}] RESCUE kicked (${reason}): ` +
-        `${rotateEgress ? "warp rotate + pair re-mint" : "pair re-mint only (egress rotation disabled)"}`,
-    )
-  } catch (e) {
-    rescueInFlight = false
-    logActivity(`[${new Date().toISOString()}] RESCUE spawn failed: ${String(e).slice(0, 200)}`)
+  const transcript = (line: string) => {
+    try {
+      mkdirSync(RESCUE_LOG.replace(/[/\\][^/\\]*$/, ""), { recursive: true })
+      appendFileSync(RESCUE_LOG, line + "\n")
+    } catch {
+      /* diagnostics only */
+    }
   }
+  transcript(
+    `--- rescue ${new Date().toISOString()} (${reason}) egress-rotate=${rotateEgress} ---`,
+  )
+
+  // The rescue runs natively here - no shell, no quoting, no curl: it is two
+  // steps, and this process can do both itself. The old version shelled out to
+  // a script, which on Windows meant cmd.exe quoting hell: it failed
+  // instantly and never wrote a transcript.
+  void (async () => {
+    try {
+      if (rotateEgress) {
+        // Rotate the egress: a new exit IP is a new quota bucket. Restart
+        // first on unix (cheap, keeps the working account); Windows has only
+        // --rotate-only, which replaces the WARP registration.
+        const attempts = isWindows
+          ? [[ROTATOR, "--rotate-only"]]
+          : [
+              [ROTATOR, "--restart-only"],
+              [ROTATOR, "--rotate-only"],
+            ]
+        for (const attempt of attempts) {
+          const [bin, ...args] = attempt
+          const proc = Bun.spawn(
+            isWindows ? ["cmd.exe", "/c", bin, ...args] : ["bash", bin, ...args],
+            { stdout: "pipe", stderr: "pipe", stdin: "ignore" },
+          )
+          const out = await proc.exited
+          let tail = ""
+          try {
+            tail = (await new Response(proc.stdout).text()).slice(-400)
+          } catch {
+            /* ignore */
+          }
+          transcript(`${bin} ${args.join(" ")} -> rc=${out} ${tail.trim()}`)
+          if (out === 0) break
+        }
+      } else {
+        transcript("egress rotation SKIPPED (experiment mode: pair-mint only)")
+      }
+
+      // Mint a fresh session/project pair through the relay's own endpoint.
+      const minted = await fetch(`http://127.0.0.1:${PORT}/relay-mint`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      })
+      const body = await minted.text()
+      transcript(`mint -> ${minted.status} ${body.slice(0, 300)}`)
+      logActivity(
+        `[${new Date().toISOString()}] RESCUE finished (${reason}): the egress was rotated and a fresh pair was minted`,
+      )
+    } catch (e) {
+      transcript(`rescue failed: ${String(e).slice(0, 300)}`)
+    } finally {
+      rescueInFlight = false
+    }
+  })()
+  logActivity(
+    `[${new Date().toISOString()}] RESCUE kicked (${reason}): ` +
+      `${rotateEgress ? "warp rotate + pair re-mint" : "pair re-mint only (egress rotation disabled)"}`,
+  )
   return true
 }
 
@@ -744,7 +761,7 @@ function withHost(list: string, host: string): string {
 /**
  * fetch() with an optional proxy bypass. Bun reads NO_PROXY when the request
  * is issued, so the env is patched around the synchronous call and restored
- * right after — the tunnel stays the default for everything else in the
+ * right after Ã¢â‚¬â€ the tunnel stays the default for everything else in the
  * process.
  *
  * forceDirect=true bypasses the proxy even when the direct-egress flag is
@@ -821,7 +838,7 @@ const RETRYABLE_STATUS = (s: number) => s === 429 || s >= 500 || s === 402
 // A rotation is in flight: the rotator writes this marker while it replaces
 // the tunnel. During that window every in-flight request fails with
 // ECONNREFUSED, which used to look like "the egress is broken" and made the
-// relay kick ANOTHER rotation — rotating the tunnel out from under the
+// relay kick ANOTHER rotation Ã¢â‚¬â€ rotating the tunnel out from under the
 // rotator, in a loop. Respect the marker: don't count those errors, and
 // don't kick a rescue while a rotation is running.
 // (the per-instance marker is defined at the top of this file)
@@ -918,13 +935,13 @@ async function mintOnce(prompt?: string, force = false): Promise<Record<string, 
     // The opencode CLI resolves the project directory from PWD, not from the
     // child's cwd. The server process exports PWD=<harness project> (here
     // /sdcard/Yoyo), so an inherited PWD makes the child create its session in
-    // the harness project — where the harvester refuses to look. Point PWD at
+    // the harness project Ã¢â‚¬â€ where the harvester refuses to look. Point PWD at
     // the scratch dir so the minted session lands in its own project.
     env.PWD = dir
     env.OLDPWD = dir
     // --standalone is mandatory: without it `opencode run` attaches to the
     // app's background service, so the new session is created in the SERVICE's
-    // project dir (/sdcard/Yoyo) instead of the scratch dir — and the
+    // project dir (/sdcard/Yoyo) instead of the scratch dir Ã¢â‚¬â€ and the
     // harvester filters that dir out, so the mint could never find its own
     // session. With --standalone the child runs its own server rooted at the
     // scratch dir, so the session id + project id are a fresh, eligible pair.
@@ -1033,8 +1050,8 @@ let watchdogTimer: ReturnType<typeof setInterval> | null = null
 
 /**
  * Stand-by takeover. This process adopted the port because another opencode
- * process owned it. If that owner goes away — its plugin is reloaded, its
- * session ends — nobody would be serving the relay any more, because the
+ * process owned it. If that owner goes away Ã¢â‚¬â€ its plugin is reloaded, its
+ * session ends Ã¢â‚¬â€ nobody would be serving the relay any more, because the
  * adopted server died with its owner. So stand by and take the port over the
  * moment it frees up: the relay must never stay down.
  */
@@ -1056,7 +1073,7 @@ function startTakeover(): void {
         takeoverTimer = null
       }
     } catch {
-      /* the port is still busy — try again on the next tick */
+      /* the port is still busy Ã¢â‚¬â€ try again on the next tick */
     }
   }, 750)
   takeoverTimer.unref?.()
@@ -1257,7 +1274,7 @@ function startServer(): void {
             const m = (JSON.parse(transformed) as { model?: string }).model
             if (typeof m === "string" && m) originModel = m
           } catch {
-            /* not JSON — fall through to the pin/default */
+            /* not JSON Ã¢â‚¬â€ fall through to the pin/default */
           }
           if (!originModel) {
             const pinned = modelPin()
@@ -1286,7 +1303,7 @@ function startServer(): void {
               logActivity(`[${new Date().toISOString()}] MODEL-OVERRIDE ${ov} (Freebuff /model pick)`)
             }
           } catch {
-            /* no override file — ignore */
+            /* no override file Ã¢â‚¬â€ ignore */
           }
           const pool = modelPool(originModel)
           const CYCLE_WAIT = [0, 20_000, 60_000]
@@ -1294,7 +1311,7 @@ function startServer(): void {
           // account (every model 429 on every egress) kept the caller waiting
           // ~5 minutes: 11 models x 3 cycles of slow 429s plus the 20 s + 60 s
           // backoffs. A caller (Freebuff, a CLI, a UI) must never be parked
-          // that long — after the budget we answer with the last error and
+          // that long Ã¢â‚¬â€ after the budget we answer with the last error and
           // the client retries when it wants to.
           const SPIN_BUDGET_MS = Number(env("RELAY_SPIN_BUDGET_MS") ?? 45_000)
           const spinStarted = Date.now()
@@ -1313,13 +1330,13 @@ function startServer(): void {
               const remaining = SPIN_BUDGET_MS - (Date.now() - spinStarted)
               if (remaining <= 0) {
                 logActivity(
-                  `[${new Date().toISOString()}] SPIN budget exhausted (${SPIN_BUDGET_MS}ms) before cycle ${cycle} — answering with the last error`,
+                  `[${new Date().toISOString()}] SPIN budget exhausted (${SPIN_BUDGET_MS}ms) before cycle ${cycle} Ã¢â‚¬â€ answering with the last error`,
                 )
                 break outer
               }
               const wait = Math.min(CYCLE_WAIT[cycle], remaining)
               logActivity(
-                `[${new Date().toISOString()}] SPIN cycle ${cycle} (all ${pool.length} models exhausted) — waiting ${wait / 1000}s`,
+                `[${new Date().toISOString()}] SPIN cycle ${cycle} (all ${pool.length} models exhausted) Ã¢â‚¬â€ waiting ${wait / 1000}s`,
               )
               await Bun.sleep(wait)
             }
@@ -1331,13 +1348,13 @@ function startServer(): void {
                 // request away at the exact moment the fix is landing.
                 if (rotationInProgress()) {
                   logActivity(
-                    `[${new Date().toISOString()}] SPIN budget reached while a rotation is in flight — waiting for it`,
+                    `[${new Date().toISOString()}] SPIN budget reached while a rotation is in flight Ã¢â‚¬â€ waiting for it`,
                   )
                   await Bun.sleep(10_000)
                   continue
                 }
                 logActivity(
-                  `[${new Date().toISOString()}] SPIN budget exhausted (${SPIN_BUDGET_MS}ms) — answering with the last error`,
+                  `[${new Date().toISOString()}] SPIN budget exhausted (${SPIN_BUDGET_MS}ms) Ã¢â‚¬â€ answering with the last error`,
                 )
                 break outer
               }
@@ -1345,7 +1362,7 @@ function startServer(): void {
               let resp: Response | null = null
               // Egress ladder per model: proxied path first, then the
               // device's native egress. A dead proxy (usque down, port
-              // drifted, rotation in flight) must not kill the request — the
+              // drifted, rotation in flight) must not kill the request Ã¢â‚¬â€ the
               // native egress is an independent quota bucket and can still
               // serve it.
               for (const egress of egressLadder()) {
@@ -1383,9 +1400,9 @@ function startServer(): void {
                   finalStatus = 0
                   finalErrBody = String(e).slice(0, 300)
                   if (egress === "proxy") {
-                    // The proxy leg failed — fall through to the direct leg.
+                    // The proxy leg failed Ã¢â‚¬â€ fall through to the direct leg.
                     logActivity(
-                      `[${new Date().toISOString()}] SPIN fetch-error via proxy (${m}): ${finalErrBody} — trying the native egress`,
+                      `[${new Date().toISOString()}] SPIN fetch-error via proxy (${m}): ${finalErrBody} Ã¢â‚¬â€ trying the native egress`,
                     )
                     continue
                   }
@@ -1403,7 +1420,7 @@ function startServer(): void {
                   )
                   if (fetchErrors >= 3) {
                     // Every egress is unreachable. Do not wait out the
-                    // 20 s + 60 s cycles — nothing can succeed while the
+                    // 20 s + 60 s cycles Ã¢â‚¬â€ nothing can succeed while the
                     // network is down, and the caller hangs for ~85 s.
                     // The rescue chain repairs the egress in the background;
                     // the client's retry is faster than our wait.
@@ -1440,7 +1457,7 @@ function startServer(): void {
               // model-specific, then stop and report the real error.
               fatalCount++
               logActivity(
-                `[${new Date().toISOString()}] SPIN ${resp.status} is not retryable (${fatalCount}/2) — ${fatalCount >= 2 ? "giving up on this body" : "trying one more model"}`,
+                `[${new Date().toISOString()}] SPIN ${resp.status} is not retryable (${fatalCount}/2) Ã¢â‚¬â€ ${fatalCount >= 2 ? "giving up on this body" : "trying one more model"}`,
               )
               if (fatalCount >= 2) break outer
             }
@@ -1717,7 +1734,7 @@ export async function startRelay(): Promise<void> {
     // is lossless: this process just talks to the existing relay as a client.
     //
     // BUT: on a plugin reload the port can still be held by OUR OWN previous
-    // instance (same pid). Adopting it would be a trap — the old server is
+    // instance (same pid). Adopting it would be a trap Ã¢â‚¬â€ the old server is
     // then stopped by its cleanup and nothing is left serving, which is how
     // the relay used to go down (connection refused) after every reload.
     // In that case wait for the old server to release the port and bind.
@@ -1741,7 +1758,7 @@ export async function startRelay(): Promise<void> {
       // opencode's plugin activation has a HARD 5 s budget: if setup() has
       // not resolved by then, every location-scoped API answers 503
       // "Location plugins did not finish activating". So the wait here is
-      // deliberately short — the stand-by takeover (startTakeover) binds the
+      // deliberately short Ã¢â‚¬â€ the stand-by takeover (startTakeover) binds the
       // port as soon as it frees up, without blocking the activation.
       for (let i = 0; i < 5; i++) {
         await Bun.sleep(250)
@@ -1796,7 +1813,7 @@ export async function startRelay(): Promise<void> {
     startWatchdog()
 
 // Proactive tunnel watchdog: probe the WARP egress every few minutes and
-// repair it from a cold start if it is down — independent of traffic, so
+// repair it from a cold start if it is down Ã¢â‚¬â€ independent of traffic, so
 // "start at any point works automatically". Cheap when healthy (probe
 // pass = no-op). The cooldown lives inside the script. Disable with
 // SAJILO_RELAY_WATCHDOG=0.
@@ -1808,18 +1825,37 @@ export async function startRelay(): Promise<void> {
 function startWatchdog(): void {
   if (watchdogTimer) return
   if (env("RELAY_WATCHDOG") === "0") return
-  const WATCHDOG =
-    env("RELAY_WATCHDOG") ?? "/usr/local/lib/opencode-warp/tunnel-watchdog.sh"
+  // The watchdog keeps the egress alive. On unix that is the usque tunnel
+  // watchdog; on Windows the opencode-warp stack ships probe.cmd, which checks
+  // the WARP egress the same way. Pointing it at the unix path here meant the
+  // spawn failed every three minutes and filled the log with noise.
+  const isWindows = process.platform === "win32"
+  const WATCHDOG = isWindows
+    ? (env("RELAY_WATCHDOG") ??
+      `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\probe.cmd`)
+    : (env("RELAY_WATCHDOG") ?? "/usr/local/lib/opencode-warp/tunnel-watchdog.sh")
+  if (!existsSync(WATCHDOG)) {
+    logActivity(
+      `[${new Date().toISOString()}] WATCHDOG not present (${WATCHDOG}) - the egress is not being watched`,
+    )
+    return
+  }
   let watchdogBusy = false
   const watchdogTick = () => {
     if (watchdogBusy) return
     watchdogBusy = true
     try {
-      const proc = Bun.spawn(["bash", WATCHDOG], {
-        stdout: "ignore",
-        stderr: "ignore",
-        stdin: "ignore",
-      })
+      const proc = isWindows
+        ? Bun.spawn(["cmd.exe", "/c", WATCHDOG], {
+            stdout: "ignore",
+            stderr: "ignore",
+            stdin: "ignore",
+          })
+        : Bun.spawn(["bash", WATCHDOG], {
+            stdout: "ignore",
+            stderr: "ignore",
+            stdin: "ignore",
+          })
       proc.unref()
       proc.exited
         .then((rc) => {

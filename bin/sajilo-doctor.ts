@@ -137,6 +137,37 @@ if (proxy) {
   warn("no proxied leg - only one exit IP, so one bucket")
 }
 
+// --- the rotation record ----------------------------------------------------
+// The relay logs every decision it makes. Summarise the recent ones so the
+// state of the free allowance is readable at a glance.
+console.log("\nrotation record")
+try {
+  const log = readFileSync(join(STATE, "relay-activity.log"), "utf8")
+  const lines = log.split("\n").filter((l) => l.startsWith("["))
+  const last = lines.slice(-400)
+  const ok200 = last.filter((l) => l.includes("UPSTREAM 200")).length
+  const spins = last.filter((l) => l.includes("SPIN 429 on")).length
+  const climbs = last.filter((l) => l.includes("trying the native egress")).length
+  const rescues = last.filter((l) => l.includes("RESCUE kicked")).length
+  const perModel = new Map<string, number>()
+  for (const l of last) {
+    const m = /SPIN 429 on ([^\s(]+)/.exec(l)
+    if (m) perModel.set(m[1], (perModel.get(m[1]) ?? 0) + 1)
+  }
+  const drained = [...perModel.entries()].sort((a, b) => b[1] - a[1])
+  ok(`${ok200} upstream 200s, ${spins} model 429s, ${climbs} ladder climbs, ${rescues} rescues (last ${last.length} log lines)`)
+  if (drained.length) {
+    const top = drained.slice(0, 4).map(([m, n]) => `${m}:${n}`).join(", ")
+    warn(`models hitting 429 most: ${top}`)
+  } else {
+    ok("no model is hitting 429")
+  }
+  const lastOk = lines.filter((l) => l.includes("UPSTREAM 200")).pop()
+  if (lastOk) ok(`last success: ${lastOk.slice(1, 20).replace("Z", "")}`)
+} catch (e) {
+  warn(`no rotation record yet: ${e}`)
+}
+
 // --- the gateway ------------------------------------------------------------
 // The real check: send the instance's own harness upstream and see if the
 // gateway accepts it. A 429 here means the harness was rejected, not that
