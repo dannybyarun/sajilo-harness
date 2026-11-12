@@ -211,6 +211,78 @@ setting replaces it. Patching it would mean a private copy of the runtime
 and it would be lost on every opencode update - so it is not done behind your
 back.
 
+## Use it from other agents
+
+The relay is a plain **OpenAI-compatible endpoint**. Any client that speaks
+OpenAI can use Sajilo as a custom provider - and it gets the whole relay
+behaviour: the gateway whitelist, the free-model pool rotation, the egress
+ladder, the spin budget, the rescue chain.
+
+```bash
+sajilo relay      # start the provider on its own (headless)
+```
+
+```
+sajilo relay listening on http://127.0.0.1:43914
+  models    : http://127.0.0.1:43914/v1/models
+  base url  : http://127.0.0.1:43914/v1
+```
+
+Then point your agent at it:
+
+```bash
+# any OpenAI SDK
+export OPENAI_BASE_URL=http://127.0.0.1:43914/v1
+export OPENAI_API_KEY=anything          # the key is ignored
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:43914/v1", api_key="anything")
+client.chat.completions.create(
+    model="deepseek-v4.1-flash-free",
+    messages=[{"role": "user", "content": "hello"}],
+)
+```
+
+```bash
+# curl
+curl http://127.0.0.1:43914/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}]}'
+```
+
+What is verified working through that endpoint:
+
+| call | result |
+|---|---|
+| `GET /v1/models` | the 11 free models - only those, because the paid ones just 429 |
+| `POST /v1/chat/completions` | `200` with a normal JSON completion |
+| the same with `"stream": true` | `text/event-stream`, `chat.completion.chunk` frames, `data: [DONE]` |
+| the same with `"tools": [...]` | real `tool_calls` back, arguments included |
+| `Authorization: Bearer <anything>` | accepted - the key is ignored |
+
+Both paths work: `/v1/...` (what every SDK appends to a base URL) and
+`/openai/v1/...`.
+
+### From another machine
+
+The relay listens on `127.0.0.1` by default, so it serves this machine (every
+local agent). To serve the network:
+
+```bash
+SAJILO_RELAY_BIND=0.0.0.0 SAJILO_RELAY_TOKEN=$(openssl rand -hex 16) sajilo relay
+```
+
+A token is **required** for anything but loopback - the relay spends the
+account's free quota, and the relay refuses to bind without one.
+
+### What does not work
+
+Clients that speak the **Anthropic** shape (`/v1/messages`) need a translator
+in front: the relay is OpenAI-shaped only. Point them at the OpenAI endpoint
+through a converter, or use an agent that speaks OpenAI.
+
 ## Platform matrix
 
 | | Linux / macOS / WSL | Windows |

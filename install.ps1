@@ -120,7 +120,7 @@ if ($launcherSrc -and (Test-Path $launcherSrc)) {
   }
 }
 if ($Here) {
-  foreach ($f in @("warp-rotate.sh", "tunnel-watchdog.sh", "sajilo-rebrand.sh", "sajilo-rebrand.ps1")) {
+  foreach ($f in @("warp-rotate.sh", "tunnel-watchdog.sh", "sajilo-rebrand.sh", "sajilo-rebrand.ps1", "sajilo-relay.ts")) {
     $p = Join-Path $Here "bin\$f"
     if (Test-Path $p) { Copy-Item $p (Join-Path $BinDir $f) -Force }
   }

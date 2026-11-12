@@ -152,15 +152,35 @@ if /i "%~1"=="status" (
   echo runtime    : %OPENCODE_BIN%
   if "%MODEL_ID%"=="" (echo model       : auto ^(the relay rotates the free pool^)) else (echo model       : %MODEL_ID%)
   echo tunnel     : none on Windows ^(native egress^)
+  echo base url   : http://127.0.0.1:%RELAY_PORT%/v1 - or /openai/v1
   exit /b 0
 )
 
 if /i "%~1"=="rebrand" goto :do_rebrand
+if /i "%~1"=="relay" goto :do_relay
 if /i "%~1"=="model" goto :do_model
 if /i "%~1"=="run" goto :do_run
 if /i "%~1"=="shell" goto :do_shell
+if /i "%~1"=="serve" goto :do_serve
 if /i "%~1"=="direct" goto :do_direct
 goto :do_tui
+
+REM --- relay: the provider on its own, for other agents ---------------------
+:do_relay
+where bun >nul 2>&1
+if errorlevel 1 goto :relay_nobun
+bun run "%ROOT%\bin\sajilo-relay.ts"
+exit /b %errorlevel%
+:relay_nobun
+echo sajilo relay needs bun ^(https://bun.sh^) - install it, or keep a sajilo
+echo session open: the relay runs inside every sajilo instance.
+exit /b 1
+
+REM --- serve: the runtime headless, so the relay stays up for other agents --
+:do_serve
+cd /d "%TARGET%"
+"%OPENCODE_BIN%" serve --stdio
+exit /b %errorlevel%
 
 REM --- shell: a shell with the sajilo environment -----------------------------
 :do_shell
@@ -191,6 +211,7 @@ set "ARGS=%ARGS% "%~1""
 shift
 goto :do_tui_next
 :do_tui_exec
+echo DEBUG target=[%TARGET%] bin=[%OPENCODE_BIN%] args=[%ARGS%] cwd=[%CD%] 1>&2
 "%OPENCODE_BIN%" --standalone%ARGS%
 exit /b %errorlevel%
 

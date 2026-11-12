@@ -71,11 +71,23 @@ function logActivity(line: string): void {
   }
 }
 
-import { Plugin } from "@opencode/plugin"
+// The plugin wrapper is only used inside the opencode runtime, but this file
+// is also imported by the standalone runner (bun), which has no @opencode/plugin
+// package. A plain object is all the runtime needs - Plugin.define() is only a
+// typing helper.
+function define<T>(plugin: T): T {
+  return plugin
+}
 
 type Ctx = { options?: Record<string, unknown>; [k: string]: unknown }
 
 const PORT = Number(env("RELAY_PORT") ?? 43904)
+// Where the relay listens. 127.0.0.1 keeps it on this machine (other local
+// agents can still use it). Set it to 0.0.0.0 to serve other machines - but
+// then a token is REQUIRED, because the relay spends the account's quota.
+const BIND = env("RELAY_BIND") ?? "127.0.0.1"
+// Optional bearer token for clients. When set, every request must carry it.
+const TOKEN = env("RELAY_TOKEN") ?? ""
 // Every path the relay touches is rooted here, so a SECOND instance can run
 // side by side with the main one (own pins, own resources, own DB) without
 // the two fighting over the same files. the sajilo instance uses
@@ -285,6 +297,21 @@ const FREE_POOL_FALLBACK = [
 
 function modelPool(origin: string): string[] {
   return [origin, ...FREE_POOL_FALLBACK.filter((m) => m !== origin)]
+}
+
+/**
+ * The catalogue served to clients. Only the free pool: the gateway lists 85
+ * models but the paid ones cannot be used with the free quota, and a client
+ * that picks one just gets a 429.
+ */
+function freeModelList(): Array<Record<string, unknown>> {
+  const ids = [DEFAULT_MODEL, ...FREE_POOL_FALLBACK].filter((m, i, a) => a.indexOf(m) === i)
+  return ids.map((id) => ({
+    id,
+    object: "model",
+    created: 0,
+    owned_by: "sajilo",
+  }))
 }
 
 function setModel(body: string, model: string): string {
@@ -808,7 +835,7 @@ let server: ReturnType<typeof Bun.serve> | null = null
 function startServer(): void {
       server = Bun.serve({
         port: PORT,
-        hostname: "127.0.0.1",
+        hostname: BIND,
         idleTimeout: 240,
         maxRequestBodySize: 64 * 1024 * 1024,
       async fetch(req: Request) {
@@ -821,7 +848,15 @@ function startServer(): void {
             session: sessionID(),
             pid: process.pid,
             port: PORT,
+            bind: BIND,
           })
+        }
+        // A token, when set, is required on everything but the health probe.
+        if (TOKEN && url.pathname !== "/relay-health") {
+          const got = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "")
+          if (got !== TOKEN) {
+            return Response.json({ error: "unauthorized" }, { status: 401 })
+          }
         }
         if (req.method === "GET" && url.pathname === "/relay-harvest") {
           // Pin the newest eligible session/project pair without minting.
@@ -852,7 +887,12 @@ function startServer(): void {
           }
           return Response.json(await mintOnce(prompt))
         }
-        if (!url.pathname.startsWith("/openai/")) {
+        // Two ways in, so any OpenAI-compatible client works out of the box:
+        //   /openai/v1/...  the canonical path
+        //   /v1/...         what every SDK appends to a base_url
+        const isOpenAIPath = url.pathname.startsWith("/openai/")
+        const isV1Path = url.pathname.startsWith("/v1/")
+        if (!isOpenAIPath && !isV1Path) {
           if (req.method === "POST" && url.pathname === "/debug-send") {
             // Raw probe: send the provided body verbatim to
             // https://opencode.ai/inference/openai/v1/chat/completions with
@@ -882,9 +922,17 @@ function startServer(): void {
               return Response.json({ error: String(e).slice(0, 300) }, { status: 502 })
             }
           }
-          return Response.json({ error: "use /openai/<path>" }, { status: 404 })
+          return Response.json({ error: "use /openai/<path> or /v1/<path>" }, { status: 404 })
         }
         hits++
+
+        // The model catalogue a client asks for. The gateway publishes all 85
+        // models, but only the free pool answers within the free quota - the
+        // rest just 429. So serve the free pool: a client that picks from
+        // this list always works.
+        if (req.method === "GET" && url.pathname.endsWith("/models")) {
+          return Response.json({ object: "list", data: freeModelList() })
+        }
 
         let body: ReadableStream<Uint8Array> | null = req.body
         let transformed = ""
@@ -919,7 +967,7 @@ function startServer(): void {
               `TRANSFORMED-BODY: ${transformed.slice(0, 1200)}`,
           )
         }
-        const target = upstreamBase() + url.pathname.replace(/^\/openai/, "")
+        const target = upstreamBase() + (isOpenAIPath ? url.pathname.replace(/^\/openai/, "") : url.pathname)
 
         // Fresh CLI-exact header set per attempt (session/project pins are
         // re-read so a background identity rotation takes effect mid-request).
@@ -1290,9 +1338,13 @@ function startServer(): void {
       },
       })
 }
-export default Plugin.define({
-  id: "local.sajilo-relay",
-  async setup(_ctx: Ctx) {
+/**
+ * Start the relay. Callable from the opencode runtime (as the plugin below)
+ * and from the standalone runner (bin/sajilo-relay.ts), so the provider can
+ * live without a TUI.
+ */
+export async function startRelay(): Promise<void> {
+  {
     if (env("RELAY_ENABLED", "BUN_RELAY") === "0") return
     if (server) return
 
@@ -1341,10 +1393,19 @@ export default Plugin.define({
       }
     }
 
+    // Serving other machines without a token would hand the account's free
+    // quota to the whole network. Refuse rather than leak.
+    const loopback = BIND === "127.0.0.1" || BIND === "localhost" || BIND === "::1"
+    if (!loopback && !TOKEN) {
+      process.stderr.write(
+        `[sajilo-relay] refusing to bind ${BIND} without a token. Set SAJILO_RELAY_TOKEN, or SAJILO_RELAY_BIND=127.0.0.1 to keep it local.\n`,
+      )
+      return
+    }
+
     try {
       startServer()
-    } catch (e) {
-      // The 1.5s health probe and the bind are not atomic: the other process
+    } catch (e) {      // The 1.5s health probe and the bind are not atomic: the other process
       // may claim the port in between. Re-check once; if a healthy relay is
       // there, adopt it, otherwise degrade to a quiet no-op instead of
       // killing plugin activation with EADDRINUSE.
@@ -1427,5 +1488,13 @@ function startWatchdog(): void {
         takeoverTimer = null
       }
     }
+  }
+}
+
+/** The opencode plugin wrapper. */
+export default define({
+  id: "local.sajilo-relay",
+  async setup(_ctx: Ctx) {
+    await startRelay()
   },
 })

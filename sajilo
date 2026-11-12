@@ -282,6 +282,15 @@ case "${1:-tui}" in
     shift
     exec bash "$(dirname "$0")/sajilo-rebrand.sh" "$@"
     ;;
+  relay)
+    # The provider on its own, for other agents.
+    if ! command -v bun >/dev/null 2>&1; then
+      echo "sajilo relay needs bun (https://bun.sh) - install it, or keep a sajilo" >&2
+      echo "session open: the relay runs inside every sajilo instance." >&2
+      exit 1
+    fi
+    exec bun run "$BIN_DIR/sajilo-relay.ts"
+    ;;
   model)
     shift
     model_cmd "${1:-}"
