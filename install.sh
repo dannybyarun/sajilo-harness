@@ -81,7 +81,7 @@ if [ -n "$HERE" ] && [ -f "$HERE/plugin/sajilo-relay.ts" ]; then
   # gateway checks the prompt's structure, so a clobbered spec can silently
   # break the harness (every request 429s). A new spec is only installed when
   # the instance does not have one yet.
-  for f in agent-prompt.txt agent-tools.json title-prompt.txt; do
+  for f in agent-prompt.txt agent-tools.json title-prompt.txt sajilo-overlay.md; do
     src="$HERE/plugin/resources/$f"
     dst="$PLUGIN_DIR/resources/$f"
     [ -f "$src" ] || continue

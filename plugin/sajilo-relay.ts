@@ -140,6 +140,135 @@ const AGENT_TOOLS = JSON.parse(
   readFileSync(`${RELAY_DIR}/resources/agent-tools.json`, "utf8"),
 ) as Array<Record<string, unknown>>
 
+// ---------------------------------------------------------------------------
+// The live harness.
+//
+// The prompt and the tool set are a CONTRACT with the gateway: it recognises
+// the agent class by the prompt's skeleton and the tool names. A snapshot of
+// them goes stale the moment opencode updates - and a stale spec fails in a
+// way that looks exactly like an empty quota window.
+//
+// So the relay LEARNS the harness instead: every request the opencode runtime
+// makes carries its own live prompt and its own live tools (MCP servers
+// included). They are captured here, kept next to the instance, and Sajilo's
+// own identity and rules are layered on top. An opencode update therefore
+// flows through by itself - the next request teaches the relay the new
+// harness.
+//
+// The overlay is resources/sajilo-overlay.md: an "# Identity" block that
+// replaces the prompt's first line, and a "# Rules" block that is appended as
+// its own section. The gateway accepts both (measured), so this is where
+// Sajilo is allowed to be Sajilo.
+const OVERLAY_FILE = `${RELAY_DIR}/resources/sajilo-overlay.md`
+const SPEC_FILE = `${RESOURCES_DIR}/harness-spec.json`
+
+type HarnessSpec = {
+  prompt: string
+  tools: Array<Record<string, unknown>>
+  capturedAt: string
+  source: string
+}
+
+function readSpec(): HarnessSpec | null {
+  try {
+    const s = JSON.parse(readFileSync(SPEC_FILE, "utf8")) as HarnessSpec
+    if (typeof s?.prompt === "string" && Array.isArray(s.tools)) return s
+  } catch {
+    /* no spec yet */
+  }
+  return null
+}
+
+function writeSpec(spec: HarnessSpec): void {
+  try {
+    writeFileSync(SPEC_FILE, JSON.stringify(spec, null, 2))
+  } catch {
+    /* diagnostics only */
+  }
+}
+
+/**
+ * The harness prompt's model block, as a template. It is filled in per
+ * request with the model that actually serves it, so the agent never claims
+ * to be a model it is not.
+ */
+const MODEL_BLOCK = `# Your Model
+- Name: {{MODEL_NAME}}
+- Provider ID: {{PROVIDER_ID}}
+- Model ID: {{MODEL_ID}}`
+
+/**
+ * Replace the runtime's model block with Sajilo's template. The runtime fills
+ * in its own block with ITS model; Sajilo fills in its own with the model
+ * the relay actually used.
+ */
+function replaceModelBlock(prompt: string): string {
+  if (!prompt.includes("# Your Model")) return prompt
+  return prompt.replace(/# Your Model\r?\n(?:- .*\r?\n?)*/g, `${MODEL_BLOCK}\n`)
+}
+
+/**
+ * Does this prompt look like the opencode agent prompt? Only such prompts are
+ * worth learning from - a third-party agent's prompt (Hermes, Cline, ...) must
+ * never become Sajilo's harness.
+ */
+function looksLikeRuntimePrompt(prompt: string): boolean {
+  return prompt.includes("# Harness") || prompt.includes("# Code Mode")
+}
+
+/**
+ * Learn the harness the runtime is actually using. Called with the
+ * INCOMING request, before it is rewritten.
+ */
+function captureLiveHarness(prompt: string, tools: unknown): void {
+  if (!prompt || !looksLikeRuntimePrompt(prompt)) return
+  const list = Array.isArray(tools) ? (tools as Array<Record<string, unknown>>) : []
+  if (list.length === 0) return
+  const current = readSpec()
+  if (current && current.prompt === prompt && current.tools.length === list.length) return
+  writeSpec({
+    prompt,
+    tools: list,
+    capturedAt: new Date().toISOString(),
+    source: "runtime",
+  })
+  logActivity(
+    `[${new Date().toISOString()}] HARNESS captured from the live runtime (${prompt.length} chars, ${list.length} tools)`,
+  )
+}
+
+/**
+ * Sajilo's layer on top of the live harness: the identity line and the rules.
+ */
+function applyOverlay(prompt: string): string {
+  let overlay = ""
+  try {
+    overlay = readFileSync(OVERLAY_FILE, "utf8")
+  } catch {
+    /* no overlay - the prompt goes as it is */
+  }
+  if (!overlay.trim()) return prompt
+
+  const sections = overlay.split(/^# (Identity|Rules)\s*$/m)
+  let out = prompt
+  // "# Identity" replaces the first line (the sentence that says who this is).
+  const identity = sections[2]?.trim()
+  if (identity) {
+    const lines = out.split("\n")
+    const first = lines.findIndex((l) => l.trim().length > 0)
+    if (first >= 0) {
+      lines[first] = identity
+      out = lines.join("\n")
+    }
+  }
+  // "# Rules" becomes its own section at the end.
+  const rules = sections[4]?.trim()
+  if (rules) {
+    out = `${out.replace(/\s+$/, "")}\n\n# Sajilo\n${rules}\n`
+  }
+  return out
+}
+
 const CLIENT = "cli"
 // UA version is part of the client fingerprint. The gateway accepted
 // "2.2.6" even on later CLI versions, but make it overridable so a future
@@ -212,17 +341,32 @@ function transformBody(raw: string): string {
   }
   const msgs = Array.isArray(parsed.messages) ? [...parsed.messages] : []
   const systems: string[] = []
+  const rawSystems: string[] = []
   const rest: Array<Record<string, unknown>> = []
   for (const m of msgs) {
     const role = (m as { role?: string }).role
     if (role === "system" || role === "developer") {
       const c = (m as { content?: unknown }).content
       const text = typeof c === "string" ? c : JSON.stringify(c)
-      if (text) systems.push(stripModelBlock(text))
+      if (text) {
+        rawSystems.push(text)
+        systems.push(stripModelBlock(text))
+      }
     } else {
       rest.push(m)
     }
   }
+  // Learn the harness the runtime is using, BEFORE it is rewritten. The RAW
+  // prompt is captured - the model block is replaced later with Sajilo's own
+  // template, so the capture stays a faithful copy of the runtime's harness.
+  if (rawSystems.length > 0) captureLiveHarness(rawSystems[0], parsed.tools)
+
+  // The live harness if we have one (it follows opencode's own updates),
+  // otherwise the shipped snapshot.
+  const spec = readSpec()
+  const basePrompt = spec?.prompt ?? AGENT_PROMPT
+  const baseTools = spec?.tools ?? AGENT_TOOLS
+
   const rewritten: Array<Record<string, unknown>> = []
   // SAJILO_RELAY_HARNESS=caller keeps the CALLER's own system prompt instead
   // of injecting Sajilo's. The gateway accepts a request with the harness
@@ -231,7 +375,11 @@ function transformBody(raw: string): string {
   if (env("RELAY_HARNESS")?.toLowerCase() === "caller" && systems.length > 0) {
     rewritten.push({ role: "system", content: systems.join("\n\n---\n\n") })
   } else {
-    rewritten.push({ role: "system", content: AGENT_PROMPT })
+    // The live harness with Sajilo's model block, identity and rules on top.
+    rewritten.push({
+      role: "system",
+      content: applyOverlay(replaceModelBlock(basePrompt)),
+    })
   }
   if (systems.length && env("RELAY_HARNESS")?.toLowerCase() !== "caller") {
     rewritten.push({
@@ -246,11 +394,11 @@ function transformBody(raw: string): string {
   }
   rewritten.push(...rest)
 
-  // Merge caller tools after the opencode set, de-duplicating by name so a
-  // caller (or our own curl tests) that already includes the opencode toolset
+  // Merge caller tools after the harness toolset, de-duplicating by name so a
+  // caller (or our own curl tests) that already includes the harness toolset
   // doesn't send duplicate tool registry entries upstream.
   const seen = new Set<string>()
-  for (const t of AGENT_TOOLS) {
+  for (const t of baseTools) {
     const n = toolName(t)
     if (n) seen.add(n)
   }
@@ -269,7 +417,7 @@ function transformBody(raw: string): string {
   // caller's. Verified against the gateway: a request with the harness prompt
   // and the caller's tools alone is accepted.
   const lean = env("RELAY_TOOLS")?.toLowerCase() === "caller"
-  const mergedTools = lean && callerTools.length > 0 ? callerTools : [...AGENT_TOOLS, ...callerTools]
+  const mergedTools = lean && callerTools.length > 0 ? callerTools : [...baseTools, ...callerTools]
   if (lean && callerTools.length > 0) {
     logActivity(
       `[${new Date().toISOString()}] TOOLS lean mode: ${callerTools.length} caller tools only (the harness toolset is not appended)`,
@@ -279,7 +427,7 @@ function transformBody(raw: string): string {
   // toolset is in the request (the gateway expects it), so the model can
   // still see it - and a call the caller cannot run breaks the turn. Tell
   // the model to stick to the caller's own tools.
-  const harnessNames = new Set(AGENT_TOOLS.map((t) => toolName(t)).filter(Boolean) as string[])
+  const harnessNames = new Set(baseTools.map((t) => toolName(t)).filter(Boolean) as string[])
   const foreignTools = callerTools.filter((t) => {
     const n = toolName(t)
     return !!n && !harnessNames.has(n)

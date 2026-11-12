@@ -369,6 +369,58 @@ policy, the model block. What you should not: the *shape* - the sections the
 gateway recognises (Harness, Communication, Working in codebases, Your Model)
 and the twelve tool names. `sajilo doctor` checks both.
 
+## The harness learns itself
+
+The harness spec is a contract with the gateway: the system prompt has to keep
+the agent-class shape and the twelve tool names have to be there. Break either
+and every request comes back `429` - which looks exactly like an empty quota
+window.
+
+So Sajilo does not keep a frozen copy. **Every request the runtime makes
+carries its own live prompt and its own live tools** - MCP servers included -
+and the relay captures them. An opencode update therefore flows through by
+itself: the next request teaches the relay the new harness, and Sajilo's
+identity and rules are layered on top.
+
+```
+live harness
+  ok    captured from the runtime (22445 chars, 12 tools, 52s ago)
+  ok    overlay: identity present
+  ok    overlay: rules present
+```
+
+What actually goes upstream is the runtime's own prompt, with Sajilo's layer
+on it:
+
+```
+# Harness | # Communication | # Working in codebases | # Your Model | # Code Mode | # Sajilo
+```
+
+- the **first line** is replaced by Sajilo's identity,
+- the **model block** is Sajilo's template, filled in per request with the
+  model that actually served it (the relay rotates models under the hood, and
+  the agent reports the truth - `Sajilo, nemotron-3.5-lightning-free`),
+- a **`# Sajilo` section** carries Sajilo's own rules.
+
+Everything else - the sections, the tool catalog, the MCP tools - is whatever
+the runtime says it is.
+
+`plugin/resources/sajilo-overlay.md` is that layer, and it is yours: the
+`# Identity` block is the sentence that replaces the first line, and the
+`# Rules` block becomes the `# Sajilo` section. Edit it, and the next request
+uses it. (The gateway accepts both - measured, not assumed.)
+
+## MCP and other plugins
+
+They come for free with the capture. A tool the runtime registers - an MCP
+server, a plugin, a skill - arrives in the request, the relay passes it
+through, and the catalog in the prompt lists it. Nothing to configure.
+
+One rule the relay adds for third-party agents: if the caller supplied its
+own tools, the model is told to use only those. The harness toolset is still
+in the request (the gateway expects it), but a call the caller cannot execute
+breaks the turn.
+
 ## Platform matrix
 
 | | Linux / macOS / WSL | Windows |

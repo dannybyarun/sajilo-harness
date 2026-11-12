@@ -80,7 +80,7 @@ if ($localPlugin -and (Test-Path $localPlugin)) {
   # gateway checks the prompt's structure, so a clobbered spec can silently
   # break the harness (every request 429s). A new spec is only installed when
   # the instance does not have one yet.
-  foreach ($r in @("agent-prompt.txt", "agent-tools.json", "title-prompt.txt")) {
+  foreach ($r in @("agent-prompt.txt", "agent-tools.json", "title-prompt.txt", "sajilo-overlay.md")) {
     $src = Join-Path $Here "plugin\resources\$r"
     $dst = Join-Path $PluginDir "resources\$r"
     if (-not (Test-Path $src)) { continue }

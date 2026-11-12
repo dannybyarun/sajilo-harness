@@ -83,6 +83,38 @@ try {
   bad(`no relay on ${BASE} - start one with: sajilo relay`)
 }
 
+// --- the live harness -------------------------------------------------------
+// The relay learns the harness the runtime is actually using, so an opencode
+// update flows through by itself. Report how fresh that capture is.
+console.log("\nlive harness")
+try {
+  const specPath = join(PLUGIN_DIR, "resources", "harness-spec.json")
+  if (existsSync(specPath)) {
+    const spec = JSON.parse(readFileSync(specPath, "utf8"))
+    const age = Math.round((Date.now() - Date.parse(spec.capturedAt)) / 1000)
+    ok(`captured from the runtime (${spec.prompt.length} chars, ${spec.tools.length} tools, ${age}s ago)`)
+    if (age > 30 * 24 * 3600) {
+      warn("the capture is old - run a sajilo session once so the relay can refresh it")
+    }
+    if (!spec.prompt.includes("# Harness")) {
+      warn("the captured prompt does not look like the runtime's own - the gateway may reject it")
+    }
+  } else {
+    warn("no live capture yet - run a sajilo session once and the relay learns the harness")
+  }
+  const overlay = join(PLUGIN_DIR, "resources", "sajilo-overlay.md")
+  if (existsSync(overlay)) {
+    const o = readFileSync(overlay, "utf8")
+    if (o.includes("# Identity")) ok("overlay: identity present")
+    else warn("the overlay has no '# Identity' block - the harness keeps the runtime's own name")
+    if (o.includes("# Rules")) ok("overlay: rules present")
+  } else {
+    warn("no overlay - Sajilo has no identity of its own yet")
+  }
+} catch (e) {
+  warn(`live harness unreadable: ${e}`)
+}
+
 // --- the gateway ------------------------------------------------------------
 // The real check: send the instance's own harness upstream and see if the
 // gateway accepts it. A 429 here means the harness was rejected, not that
@@ -112,7 +144,23 @@ if (health) {
       } catch {}
       if (reply) ok(`model replied: ${reply.slice(0, 60).replace(/\s+/g, " ")}`)
     } else if (r.status === 429) {
-      bad(`gateway answered 429 (${secs}s) - either the free window is empty, or the harness was rejected. Compare: sajilo relay --lean serves the same request shape without the harness`)
+      // 429 means one of two things, and they look identical from outside:
+      // the free window is empty, or the gateway stopped accepting this
+      // harness. The relay's own log tells them apart - if the harness was
+      // accepted at least once AFTER the last capture changed, then the
+      // harness is fine and the window is what ran out.
+      let verdict = "either the free window is empty, or the harness was rejected"
+      try {
+        const log = readFileSync(join(STATE, "relay-activity.log"), "utf8")
+        const lastOk = log.lastIndexOf("UPSTREAM 200")
+        const lastChange = Math.max(log.lastIndexOf("HARNESS captured"), log.lastIndexOf("MODEL-PINNED"))
+        if (lastOk > lastChange && lastOk > 0) {
+          verdict = "the free window is empty - this harness was accepted after its last change"
+        }
+      } catch {
+        /* no log to compare against */
+      }
+      bad(`gateway answered 429 (${secs}s): ${verdict}`)
     } else {
       warn(`gateway answered ${r.status} (${secs}s): ${text.slice(0, 120)}`)
     }
