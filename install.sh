@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh - one-click installer for Linux / macOS / WSL / Git Bash.
 #
-#   curl -fsSL https://raw.githubusercontent.com/dannybyarun/sajilo/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/dannybyarun/sajilo-harness/main/install.sh | bash
 #
 # or, from a clone:
 #
@@ -12,7 +12,7 @@
 # launcher on PATH and drops a desktop launcher. Nothing to configure by hand.
 set -u
 
-REPO_URL=${SAJILO_REPO_URL:-https://raw.githubusercontent.com/dannybyarun/sajilo/main}
+REPO_URL=${SAJILO_REPO_URL:-https://raw.githubusercontent.com/dannybyarun/sajilo-harness/main}
 
 # Where does this script live? When it is piped into bash there is no script
 # directory at all ($0 is just "bash"), so the plugin is fetched from the

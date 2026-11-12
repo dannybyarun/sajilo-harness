@@ -54,13 +54,13 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ### Linux / macOS - one command
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dannybyarun/sajilo/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dannybyarun/sajilo-harness/main/install.sh | bash
 ```
 
 Or from a clone:
 
 ```bash
-git clone https://github.com/dannybyarun/sajilo.git
+git clone https://github.com/dannybyarun/sajilo-harness.git
 cd sajilo
 bash install.sh
 ```

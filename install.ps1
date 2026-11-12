@@ -23,7 +23,7 @@ $ErrorActionPreference = "Stop"
 
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $Here) { $Here = "" }
-$RepoUrl = "https://raw.githubusercontent.com/dannybyarun/sajilo/main"
+$RepoUrl = "https://raw.githubusercontent.com/dannybyarun/sajilo-harness/main"
 
 if ($env:SAJILO_ROOT) {
   $Root = $env:SAJILO_ROOT

@@ -45,14 +45,14 @@ jobs:
 
             ```bash
             # Linux / macOS / WSL / Git Bash
-            curl -fsSL https://github.com/dannybyarun/sajilo/releases/latest/download/sajilo-bootstrap.tar.gz | tar xz
+            curl -fsSL https://github.com/dannybyarun/sajilo-harness/releases/latest/download/sajilo-bootstrap.tar.gz | tar xz
             cd sajilo && bash install.sh
             ~/.local/bin/sajilo
             ```
 
             ```powershell
             # Windows
-            curl -fsSL -o sajilo-bootstrap.zip https://github.com/dannybyarun/sajilo/releases/latest/download/sajilo-bootstrap.zip
+            curl -fsSL -o sajilo-bootstrap.zip https://github.com/dannybyarun/sajilo-harness/releases/latest/download/sajilo-bootstrap.zip
             Expand-Archive sajilo-bootstrap.zip
             cd sajilo
             powershell -ExecutionPolicy Bypass -File .\install.ps1
@@ -62,7 +62,7 @@ jobs:
             Windows, or run the one-liner:
 
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/dannybyarun/sajilo/main/install.sh | bash
+            curl -fsSL https://raw.githubusercontent.com/dannybyarun/sajilo-harness/main/install.sh | bash
             ```
 
             See the README for the platform matrix (the rotatable WARP tunnel
