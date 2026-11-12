@@ -164,6 +164,13 @@ try {
   }
   const lastOk = lines.filter((l) => l.includes("UPSTREAM 200")).pop()
   if (lastOk) ok(`last success: ${lastOk.slice(1, 20).replace("Z", "")}`)
+  const served = lines.filter((l) => l.includes("] SERVED ")).pop()
+  if (served) {
+    const m = /] SERVED (\S+)(.*)$/.exec(served)
+    ok(`last model that answered: ${m?.[1] ?? "?"}${m?.[2]?.trim() ? ` ${m[2].trim()}` : ""}`)
+  }
+  const rotations = last.filter((l) => l.includes("SPIN fallback used")).length
+  if (rotations) warn(`${rotations} request(s) in the last ${last.length} lines were answered by a different model than requested`)
 } catch (e) {
   warn(`no rotation record yet: ${e}`)
 }

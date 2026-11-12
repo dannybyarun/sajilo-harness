@@ -1258,6 +1258,7 @@ function startServer(): void {
         // Spin loop: transparent model rotation + backoff + optional identity
         // rotation. Only for chat/completions; everything else stays 1:1.
         let upstream: Response | null = null
+        let servedModel = ""
         let finalStatus = 0
         let finalErrBody = "<no response>"
         if (isChat) {
@@ -1435,11 +1436,20 @@ function startServer(): void {
               if (!resp) continue
               if (resp.status === 200) {
                 upstream = resp
+                servedModel = m
                 if (m !== originModel) {
                   logActivity(
                     `[${new Date().toISOString()}] SPIN fallback used: ${originModel} -> ${m}`,
                   )
                 }
+                // Say plainly which model answered. The relay rotates under the
+                // hood, so the model the client asked for is not always the one
+                // that replied - and "which model was that?" is the first
+                // question anyone asks when the answers feel different.
+                logActivity(
+                  `[${new Date().toISOString()}] SERVED ${m}` +
+                    `${m === originModel ? " (as requested)" : ` (rotated from ${originModel})`}`,
+                )
                 break outer
               }
               const errBody = await resp.text().catch(() => "<unreadable>")
@@ -1489,6 +1499,10 @@ function startServer(): void {
               `[${new Date().toISOString()}] UPSTREAM ${upstream.status} ${target}` +
                 ` (incoming ${url.pathname})`,
             )
+            // Tell the client which model actually answered. The response body
+            // carries the upstream's model id, but a header is easier to spot
+            // (curl -i, an SDK's response headers, a proxy log).
+            if (servedModel) respHeaders.set("x-sajilo-model", servedModel)
           } else {
             logActivity(
               `[${new Date().toISOString()}] UPSTREAM ${finalStatus} ${target}` +
@@ -1591,7 +1605,10 @@ function startServer(): void {
           )
           return new Response(JSON.stringify(completion), {
             status: 200,
-            headers: { "content-type": "application/json" },
+            headers: {
+              "content-type": "application/json",
+              ...(servedModel ? { "x-sajilo-model": servedModel } : {}),
+            },
           })
         } catch (e) {
           logActivity(`[${new Date().toISOString()}] FETCH-ERROR ${target}: ${String(e).slice(0, 300)}`)
