@@ -45,7 +45,7 @@
  * for upstream paths other than chat/completions.
  */
 
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 
 /**
  * Environment lookup. SAJILO_* is canonical; the OPENCODE_* names stay as
@@ -139,6 +139,21 @@ const AGENT_PROMPT = readFileSync(
 const AGENT_TOOLS = JSON.parse(
   readFileSync(`${RELAY_DIR}/resources/agent-tools.json`, "utf8"),
 ) as Array<Record<string, unknown>>
+
+// The free pool, as the runtime's own provider presents it.
+const SAJILO_MODEL_LIST: Record<string, { name: string }> = {
+  "deepseek-v4.1-flash-free": { name: "DeepSeek V4.1 Flash Free" },
+  "glm-5.3-flash-free": { name: "GLM 5.3 Flash Free" },
+  "mimo-v2.6-flash-free": { name: "MiMo v2.6 Flash Free" },
+  "longcat-2.5-free": { name: "LongCat 2.5" },
+  "iceman-free": { name: "Iceman" },
+  "inkling-2-small-free": { name: "Inkling 2 Small" },
+  "beam-free": { name: "Beam" },
+  "flint-40b-free": { name: "Flint 40B" },
+  "nemotron-3.5-lightning-free": { name: "Nemotron 3.5 Lightning" },
+  "minimax-m3.1-flash-free": { name: "MiniMax M3.1 Flash" },
+  "nemotron-3.5-super-vl-free": { name: "Nemotron 3.5 Super VL" },
+}
 
 // ---------------------------------------------------------------------------
 // The live harness.
@@ -1552,6 +1567,106 @@ function startServer(): void {
  * and from the standalone runner (bin/sajilo-relay.ts), so the provider can
  * live without a TUI.
  */
+/**
+ * Point the runtime at THIS relay without touching the rest of the user's
+ * config.
+ *
+ * The config file belongs to the user: it is where MCP servers, permissions,
+ * agents and commands live. The launcher used to overwrite it on every start,
+ * which wiped all of that. The provider and the model are merged IN instead -
+ * the user's keys are preserved, and only ours are set.
+ *
+ * JSONC comments and trailing commas are tolerated: the file is parsed as
+ * JSONC, and if it cannot be parsed the config is left exactly as it is.
+ */
+function mergeRuntimeConfig(port: number): void {
+  const dir = `${process.env.HOME ?? ""}/.config/opencode`
+  const candidates = [`${dir}/opencode.json`, `${dir}/opencode.jsonc`]
+  const file = candidates.find((f) => {
+    try {
+      return existsSync(f)
+    } catch {
+      return false
+    }
+  })
+  if (!file) {
+    logActivity(
+      `[${new Date().toISOString()}] CONFIG no config file found in ${dir} (looked for opencode.json and opencode.jsonc)`,
+    )
+    return
+  }
+
+  let raw = ""
+  try {
+    raw = readFileSync(file, "utf8")
+  } catch {
+    return
+  }
+  // Strip a UTF-8 BOM: opencode's parser rejects the whole file when one is
+  // there, and Windows editors love to add them.
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1)
+
+  let cfg: Record<string, unknown>
+  try {
+    // JSONC -> JSON: drop line comments and trailing commas.
+    const stripped = raw
+      .replace(/^\s*\/\/.*$/gm, "")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/,(\s*[}\]])/g, "$1")
+    cfg = JSON.parse(stripped) as Record<string, unknown>
+  } catch {
+    logActivity(
+      `[${new Date().toISOString()}] CONFIG ${file} is not valid JSON/JSONC - left untouched`,
+    )
+    return
+  }
+
+  const model = readModelPin()
+  const which = (env("RELAY_PROVIDER") ?? "sajilo").toLowerCase()
+  if (which === "none") {
+    // "direct": the runtime talks to the gateway without the relay. Leave the
+    // user's config exactly as it is.
+    return
+  }
+  const providerId = which === "opencode" ? "opencode" : "sajilo"
+  const providerName = providerId === "opencode" ? "OpenCode" : "Sajilo"
+  const provider: Record<string, unknown> = {
+    ...(typeof cfg.provider === "object" && cfg.provider ? (cfg.provider as Record<string, unknown>) : {}),
+    [providerId]: {
+      npm: "@ai-sdk/openai-compatible",
+      name: providerName,
+      options: { baseURL: `http://127.0.0.1:${port}/openai/v1` },
+      models: SAJILO_MODEL_LIST,
+    },
+  }
+  const before = JSON.stringify(cfg)
+  cfg.provider = provider
+  if (model) cfg.model = `${providerId}/${model}`
+  if (before === JSON.stringify(cfg)) return
+  try {
+    writeFileSync(file, JSON.stringify(cfg, null, 2))
+    logActivity(
+      `[${new Date().toISOString()}] CONFIG merged the sajilo provider into ${file} (the rest of your config is untouched)`,
+    )
+  } catch (e) {
+    logActivity(`[${new Date().toISOString()}] CONFIG merge failed: ${String(e).slice(0, 200)}`)
+  }
+}
+
+function readModelPin(): string {
+  // The pin lives in the INSTANCE's state dir, not under HOME (HOME is the
+  // instance's home). SAJILO_ROOT is the instance root.
+  const root = process.env.SAJILO_ROOT ?? `${process.env.HOME ?? ""}/..`
+  try {
+    const m = readFileSync(`${root}/state/model.txt`, "utf8").trim()
+    if (m && m !== "auto") return m
+  } catch {
+    /* no pin file - the default model applies */
+  }
+  // Same default the launcher uses, so the runtime and the relay always agree.
+  return DEFAULT_MODEL
+}
+
 export async function startRelay(): Promise<void> {
   {
     if (env("RELAY_ENABLED", "BUN_RELAY") === "0") return
@@ -1611,6 +1726,9 @@ export async function startRelay(): Promise<void> {
       )
       return
     }
+
+    // Point the runtime at this relay, keeping the user's config intact.
+    mergeRuntimeConfig(PORT)
 
     try {
       startServer()

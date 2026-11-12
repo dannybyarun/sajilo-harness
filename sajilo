@@ -76,7 +76,8 @@ if [ -z "$MODEL_ID" ] && [ -z "$MODEL_AUTO" ]; then
   MODEL_ID="deepseek-v4.1-flash-free"
 fi
 PROVIDER_PREFIX=sajilo
-[ -f "$STATE/stock-identity" ] && PROVIDER_PREFIX=opencode
+PROVIDER_NAME=Sajilo
+[ -f "$STATE/stock-identity" ] && PROVIDER_PREFIX=opencode && PROVIDER_NAME=OpenCode
 
 # Where to run: the directory you are standing in, or the one you name -
 # exactly like opencode does. The isolation comes from the HOME (own DB, own
@@ -185,55 +186,19 @@ use_relay() {
   if [ -n "$MODEL_ID" ]; then
     model_json=",\"model\":\"$PROVIDER_PREFIX/$MODEL_ID\""
   fi
-  # A provider of OUR OWN instead of the built-in "opencode" one: the TUI then
-  # shows Sajilo next to the model instead of OpenCode, and /model offers
-  # exactly the free pool the relay can serve.
-  if [ -f "$STATE/stock-identity" ]; then
-    cat >"$HOME_DIR/.config/opencode/opencode.json" <<EOF
-{
-  "\$schema": "https://opencode.ai/config.json"$model_json,
-  "provider": {
-    "opencode": {
-      "options": {
-        "baseURL": "http://127.0.0.1:$RELAY_PORT/openai/v1"
-      }
-    }
-  }
-}
-EOF
-    return
-  fi
-  cat >"$HOME_DIR/.config/opencode/opencode.json" <<EOF
-{
-  "\$schema": "https://opencode.ai/config.json"$model_json,
-  "provider": {
-    "sajilo": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Sajilo",
-      "options": {
-        "baseURL": "http://127.0.0.1:$RELAY_PORT/openai/v1"
-      },
-      "models": {
-        "deepseek-v4.1-flash-free": { "name": "DeepSeek V4.1 Flash Free" },
-        "glm-5.3-flash-free": { "name": "GLM 5.3 Flash Free" },
-        "mimo-v2.6-flash-free": { "name": "MiMo v2.6 Flash Free" },
-        "longcat-2.5-free": { "name": "LongCat 2.5" },
-        "iceman-free": { "name": "Iceman" },
-        "inkling-2-small-free": { "name": "Inkling 2 Small" },
-        "beam-free": { "name": "Beam" },
-        "flint-40b-free": { "name": "Flint 40B" },
-        "nemotron-3.5-lightning-free": { "name": "Nemotron 3.5 Lightning" },
-        "minimax-m3.1-flash-free": { "name": "MiniMax M3.1 Flash" },
-        "nemotron-3.5-super-vl-free": { "name": "Nemotron 3.5 Super VL" }
-      }
-    }
-  }
-}
-EOF
+  # The provider and the model are NOT written into the config file - that
+  # file belongs to the user (it is where "opencode mcp add", permissions,
+  # agents and commands live). The relay plugin MERGES the sajilo provider
+  # into it at startup, which keeps every other key intact.
+  export SAJILO_RELAY_PROVIDER=sajilo
+  [ -f "$STATE/stock-identity" ] && export SAJILO_RELAY_PROVIDER=opencode
 }
 
 use_direct() {
-  rm -f "$HOME_DIR/.config/opencode/opencode.json" 2>/dev/null || true
+  # Opt out of the relay: the runtime talks to the gateway directly (no
+  # ladder, no pool, no budget, no rescue). The config file is the user's and
+  # is never touched, so nothing to remove here.
+  export SAJILO_RELAY_PROVIDER=none
 }
 
 # sajilo model            -> show the current choice

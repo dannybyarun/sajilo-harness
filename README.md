@@ -412,14 +412,40 @@ uses it. (The gateway accepts both - measured, not assumed.)
 
 ## MCP and other plugins
 
-They come for free with the capture. A tool the runtime registers - an MCP
-server, a plugin, a skill - arrives in the request, the relay passes it
-through, and the catalog in the prompt lists it. Nothing to configure.
+Add them exactly the way you add them to opencode:
 
-One rule the relay adds for third-party agents: if the caller supplied its
-own tools, the model is told to use only those. The harness toolset is still
-in the request (the gateway expects it), but a call the caller cannot execute
-breaks the turn.
+```bash
+sajilo mcp list
+sajilo mcp add browse -- browse mcp
+```
+
+The instance's config is `~/.sajilo/home/.config/opencode/opencode.json(c)` -
+the same file opencode uses, so `mcp add`, permissions, agents and commands all
+work normally.
+
+**The launcher never writes that file.** It used to, and it wiped everything
+you had added. Now the relay plugin *merges* the sajilo provider into it at
+startup and leaves every other key alone:
+
+```jsonc
+{
+  "mcp": { "servers": { "browse": { "type": "local", "command": ["browse", "mcp"] } } },
+  "provider": { "sajilo": { "name": "Sajilo", "options": { "baseURL": "http://127.0.0.1:43914/openai/v1" } } },
+  "model": "sajilo/deepseek-v4.1-flash-free"
+}
+```
+
+Your MCP, your permissions, your agents - and Sajilo's provider on top.
+
+One trap worth knowing: **a UTF-8 BOM in the config file makes opencode ignore
+the whole file.** PowerShell's `Set-Content -Encoding utf8` writes one, and so
+do some Windows editors. If your MCP servers mysteriously disappear, check the
+first three bytes (`EF BB BF` is a BOM) - the merger strips it when it writes,
+but it cannot save a file it cannot parse.
+
+MCP tools are *deferred* by the runtime (discovered on demand rather than sent
+upfront), so they never bloat the request - the relay needs no special
+handling for them.
 
 ## Platform matrix
 

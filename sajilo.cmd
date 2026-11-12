@@ -131,20 +131,17 @@ if not "%~1"=="" if exist "%~1\" (
   shift
 )
 
-REM A provider of OUR OWN instead of the built-in "opencode" one: the TUI then
-REM shows Sajilo next to the model instead of OpenCode, and /model offers
-REM exactly the free pool the relay can serve.
-set "CFG=%HOME_DIR%\.config\opencode\opencode.json"
-if /i "%~1"=="direct" (
-  if exist "%CFG%" del /q "%CFG%"
-) else if exist "%STATE%\stock-identity" (
-  >"%CFG%" echo {"$schema":"https://opencode.ai/config.json"%MODEL_JSON%,"provider":{"opencode":{"options":{"baseURL":"http://127.0.0.1:%RELAY_PORT%/openai/v1"}}}}
-) else (
-  >"%CFG%" echo {"$schema":"https://opencode.ai/config.json"%MODEL_JSON%,"provider":{"sajilo":{"npm":"@ai-sdk/openai-compatible","name":"Sajilo","options":{"baseURL":"http://127.0.0.1:%RELAY_PORT%/openai/v1"},"models":{
-  >>"%CFG%" echo "deepseek-v4.1-flash-free":{"name":"DeepSeek V4.1 Flash Free"},"glm-5.3-flash-free":{"name":"GLM 5.3 Flash Free"},"mimo-v2.6-flash-free":{"name":"MiMo v2.6 Flash Free"},"longcat-2.5-free":{"name":"LongCat 2.5"},
-  >>"%CFG%" echo "iceman-free":{"name":"Iceman"},"inkling-2-small-free":{"name":"Inkling 2 Small"},"beam-free":{"name":"Beam"},"flint-40b-free":{"name":"Flint 40B"},
-  >>"%CFG%" echo "nemotron-3.5-lightning-free":{"name":"Nemotron 3.5 Lightning"},"minimax-m3.1-flash-free":{"name":"MiniMax M3.1 Flash"},"nemotron-3.5-super-vl-free":{"name":"Nemotron 3.5 Super VL"}}}}}
-)
+REM --- the provider, and where it is merged in -------------------------------
+REM The config file belongs to the user: it is where "opencode mcp add",
+REM permissions, agents and commands live. So the launcher does NOT write it -
+REM the relay plugin MERGES the sajilo provider into it at startup (see
+REM mergeRuntimeConfig in sajilo-relay.ts), which keeps every other key intact.
+REM
+REM "direct" talks to the gateway without the relay; "sajilo rebrand
+REM --restore" keeps the stock opencode name.
+set "SAJILO_RELAY_PROVIDER=sajilo"
+if /i "%~1"=="direct" set "SAJILO_RELAY_PROVIDER=none"
+if exist "%STATE%\stock-identity" set "SAJILO_RELAY_PROVIDER=opencode"
 
 if /i "%~1"=="status" (
   echo root       : %ROOT%
