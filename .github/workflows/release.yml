@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: package the bootstrap
+        run: |
+          # NOTE: the staging dir cannot be called "sajilo" - the repo root
+          # has the same name as the launcher FILE in it.
+          rm -rf pkg
+          mkdir -p pkg/plugin/resources pkg/bin
+          cp plugin/sajilo-relay.ts pkg/plugin/
+          cp plugin/resources/* pkg/plugin/resources/
+          cp install.sh install.ps1 install.cmd sajilo sajilo.cmd README.md pkg/
+          cp bin/warp-rotate.sh bin/tunnel-watchdog.sh pkg/bin/ 2>/dev/null || true
+          tar -czf sajilo-bootstrap.tar.gz -C pkg .
+          (cd pkg && zip -qr ../sajilo-bootstrap.zip .)
+          ls -la sajilo-bootstrap.*
+
+      - name: publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sajilo-bootstrap.tar.gz
+            sajilo-bootstrap.zip
+          generate_release_notes: true
+          body: |
+            ## Sajilo
+
+            A coding agent harness of its own - its own system prompt, its own
+            12-tool set, its own identity - running in a completely isolated
+            instance: its own database, sessions, project, relay (43914), pins
+            and logs. It cannot disconnect an opencode you are already running.
+
+            ```bash
+            # Linux / macOS / WSL / Git Bash
+            curl -fsSL https://github.com/dannybyarun/sajilo/releases/latest/download/sajilo-bootstrap.tar.gz | tar xz
+            cd sajilo && bash install.sh
+            ~/.local/bin/sajilo
+            ```
+
+            ```powershell
+            # Windows
+            curl -fsSL -o sajilo-bootstrap.zip https://github.com/dannybyarun/sajilo/releases/latest/download/sajilo-bootstrap.zip
+            Expand-Archive sajilo-bootstrap.zip
+            cd sajilo
+            powershell -ExecutionPolicy Bypass -File .\install.ps1
+            ```
+
+            Or skip the download entirely - double-click `install.cmd` on
+            Windows, or run the one-liner:
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/dannybyarun/sajilo/main/install.sh | bash
+            ```
+
+            See the README for the platform matrix (the rotatable WARP tunnel
+            needs `usque`; elsewhere the relay uses the native egress).
