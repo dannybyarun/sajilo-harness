@@ -48,6 +48,31 @@ foreach ($d in @((Join-Path $PluginDir "resources"), $StateDir, $WorkDir, $MintD
 Say "root -> $Root"
 
 # ---------------------------------------------------------------- plugin
+# Three sources, in order: the files next to this script, the repository, and
+# the published release bundle. The release bundle is the fallback because a
+# branch URL on the raw CDN can serve a stale copy for minutes after a push,
+# and a fresh user must never get a broken install.
+$ReleaseUrl = "https://github.com/dannybyarun/sajilo-harness/releases/latest/download/sajilo-bootstrap.zip"
+$BundleDir = ""
+
+function Get-ReleaseBundle {
+  $tmp = Join-Path $env:TEMP "sajilo-bundle"
+  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+  $zip = Join-Path $tmp "bundle.zip"
+  Say "falling back to the release bundle -> $ReleaseUrl"
+  try {
+    & curl.exe -fsSL -o $zip $ReleaseUrl
+    if ($LASTEXITCODE -ne 0) { throw "download failed" }
+    Expand-Archive -Path $zip -DestinationPath $tmp -Force
+  } catch {
+    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    return $null
+  }
+  Remove-Item $zip -Force -ErrorAction SilentlyContinue
+  return $tmp
+}
+
 $localPlugin = if ($Here) { Join-Path $Here "plugin\sajilo-relay.ts" } else { "" }
 if ($localPlugin -and (Test-Path $localPlugin)) {
   Copy-Item $localPlugin (Join-Path $PluginDir "sajilo-relay.ts") -Force
@@ -55,11 +80,25 @@ if ($localPlugin -and (Test-Path $localPlugin)) {
   Say "relay plugin installed -> $PluginDir"
 } else {
   Say "relay plugin not found next to the installer - downloading it"
-  Invoke-WebRequest -Uri "$RepoUrl/plugin/sajilo-relay.ts" -OutFile (Join-Path $PluginDir "sajilo-relay.ts") -UseBasicParsing
-  foreach ($r in @("agent-prompt.txt", "agent-tools.json", "title-prompt.txt")) {
-    Invoke-WebRequest -Uri "$RepoUrl/plugin/resources/$r" -OutFile (Join-Path $PluginDir "resources\$r") -UseBasicParsing
+  $got = $false
+  try {
+    Invoke-WebRequest -Uri "$RepoUrl/plugin/sajilo-relay.ts" -OutFile (Join-Path $PluginDir "sajilo-relay.ts") -UseBasicParsing
+    foreach ($r in @("agent-prompt.txt", "agent-tools.json", "title-prompt.txt")) {
+      Invoke-WebRequest -Uri "$RepoUrl/plugin/resources/$r" -OutFile (Join-Path $PluginDir "resources\$r") -UseBasicParsing
+    }
+    $got = $true
+  } catch {
+    $got = $false
   }
-  Say "relay plugin downloaded -> $PluginDir"
+  if ($got) {
+    Say "relay plugin downloaded -> $PluginDir"
+  } else {
+    $BundleDir = Get-ReleaseBundle
+    if (-not $BundleDir) { throw "could not download the relay plugin" }
+    Copy-Item (Join-Path $BundleDir "plugin\sajilo-relay.ts") (Join-Path $PluginDir "sajilo-relay.ts") -Force
+    Copy-Item (Join-Path $BundleDir "plugin\resources\*") (Join-Path $PluginDir "resources") -Force
+    Say "relay plugin installed from the release bundle -> $PluginDir"
+  }
 }
 
 # ---------------------------------------------------------------- launcher
@@ -67,7 +106,18 @@ $launcherSrc = if ($Here) { Join-Path $Here "sajilo.cmd" } else { "" }
 if ($launcherSrc -and (Test-Path $launcherSrc)) {
   Copy-Item $launcherSrc (Join-Path $BinDir "sajilo.cmd") -Force
 } else {
-  Invoke-WebRequest -Uri "$RepoUrl/sajilo.cmd" -OutFile (Join-Path $BinDir "sajilo.cmd") -UseBasicParsing
+  $got = $false
+  try {
+    Invoke-WebRequest -Uri "$RepoUrl/sajilo.cmd" -OutFile (Join-Path $BinDir "sajilo.cmd") -UseBasicParsing
+    $got = $true
+  } catch {
+    $got = $false
+  }
+  if (-not $got) {
+    if (-not $BundleDir) { $BundleDir = Get-ReleaseBundle }
+    if (-not $BundleDir) { throw "could not download the launcher" }
+    Copy-Item (Join-Path $BundleDir "sajilo.cmd") (Join-Path $BinDir "sajilo.cmd") -Force
+  }
 }
 if ($Here) {
   foreach ($f in @("warp-rotate.sh", "tunnel-watchdog.sh")) {

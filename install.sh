@@ -48,6 +48,33 @@ mkdir -p "$PLUGIN_DIR/resources" "$STATE" "$WORK_DIR" "$ROOT/mint" "$BIN_DIR" \
 say "root -> $ROOT"
 
 # ------------------------------------------------------------------ plugin
+# Three sources, in order: the files next to this script, the repository, and
+# the published release bundle. The release bundle is the fallback because a
+# branch URL on the raw CDN can serve a stale copy for minutes after a push,
+# and a fresh user must never get a broken install.
+RELEASE_URL=${SAJILO_RELEASE_URL:-https://github.com/dannybyarun/sajilo-harness/releases/latest/download/sajilo-bootstrap.tar.gz}
+BUNDLE_DIR=""
+
+fetch_bundle() {
+  command -v curl >/dev/null 2>&1 || return 1
+  command -v tar >/dev/null 2>&1 || return 1
+  local tmp
+  tmp=$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/sajilo-bundle.$$")
+  mkdir -p "$tmp"
+  say "falling back to the release bundle -> $RELEASE_URL"
+  if ! curl -fsSL "$RELEASE_URL" -o "$tmp/pkg.tar.gz"; then
+    rm -rf "$tmp"
+    return 1
+  fi
+  if ! tar -xzf "$tmp/pkg.tar.gz" -C "$tmp"; then
+    rm -rf "$tmp"
+    return 1
+  fi
+  rm -f "$tmp/pkg.tar.gz"
+  BUNDLE_DIR="$tmp"
+  return 0
+}
+
 if [ -n "$HERE" ] && [ -f "$HERE/plugin/sajilo-relay.ts" ]; then
   cp -f "$HERE/plugin/sajilo-relay.ts" "$PLUGIN_DIR/"
   cp -f "$HERE"/plugin/resources/* "$PLUGIN_DIR/resources/" 2>/dev/null || true
@@ -55,12 +82,18 @@ if [ -n "$HERE" ] && [ -f "$HERE/plugin/sajilo-relay.ts" ]; then
 else
   say "relay plugin not found next to the installer - downloading it"
   command -v curl >/dev/null 2>&1 || die "curl is required to download the relay plugin"
-  curl -fsSL "$REPO_URL/plugin/sajilo-relay.ts" -o "$PLUGIN_DIR/sajilo-relay.ts" \
-    || die "could not download the relay plugin"
-  for f in agent-prompt.txt agent-tools.json title-prompt.txt; do
-    curl -fsSL "$REPO_URL/plugin/resources/$f" -o "$PLUGIN_DIR/resources/$f" 2>/dev/null || true
-  done
-  say "relay plugin downloaded -> $PLUGIN_DIR"
+  if curl -fsSL "$REPO_URL/plugin/sajilo-relay.ts" -o "$PLUGIN_DIR/sajilo-relay.ts"; then
+    for f in agent-prompt.txt agent-tools.json title-prompt.txt; do
+      curl -fsSL "$REPO_URL/plugin/resources/$f" -o "$PLUGIN_DIR/resources/$f" 2>/dev/null || true
+    done
+    say "relay plugin downloaded -> $PLUGIN_DIR"
+  else
+    fetch_bundle || die "could not download the relay plugin"
+    cp -f "$BUNDLE_DIR/plugin/sajilo-relay.ts" "$PLUGIN_DIR/" \
+      || die "the release bundle has no relay plugin"
+    cp -f "$BUNDLE_DIR"/plugin/resources/* "$PLUGIN_DIR/resources/" 2>/dev/null || true
+    say "relay plugin installed from the release bundle -> $PLUGIN_DIR"
+  fi
 fi
 
 # ---------------------------------------------------------------- launcher
@@ -69,12 +102,15 @@ if [ -n "$HERE" ] && [ -f "$HERE/sajilo" ]; then
   for f in warp-rotate.sh tunnel-watchdog.sh; do
     [ -f "$HERE/bin/$f" ] && cp -f "$HERE/bin/$f" "$BIN_DIR/"
   done
-else
-  curl -fsSL "$REPO_URL/sajilo" -o "$BIN_DIR/sajilo" \
-    || die "could not download the launcher"
+elif curl -fsSL "$REPO_URL/sajilo" -o "$BIN_DIR/sajilo"; then
   for f in warp-rotate.sh tunnel-watchdog.sh; do
     curl -fsSL "$REPO_URL/bin/$f" -o "$BIN_DIR/$f" 2>/dev/null || true
   done
+else
+  [ -n "$BUNDLE_DIR" ] || fetch_bundle || die "could not download the launcher"
+  cp -f "$BUNDLE_DIR/sajilo" "$BIN_DIR/sajilo" || die "the release bundle has no launcher"
+  cp -f "$BUNDLE_DIR"/bin/*.sh "$BIN_DIR/" 2>/dev/null || true
+  say "launcher installed from the release bundle -> $BIN_DIR/sajilo"
 fi
 chmod +x "$BIN_DIR/sajilo" 2>/dev/null || true
 chmod +x "$BIN_DIR"/*.sh 2>/dev/null || true
