@@ -78,6 +78,15 @@ fi
 PROVIDER_PREFIX=sajilo
 [ -f "$STATE/stock-identity" ] && PROVIDER_PREFIX=opencode
 
+# Where to run: the directory you are standing in, or the one you name -
+# exactly like opencode does. The isolation comes from the HOME (own DB, own
+# sessions, own config), never from the project directory.
+TARGET="$PWD"
+if [ -n "${1:-}" ] && [ -d "$1" ]; then
+  TARGET=$(cd "$1" && pwd)
+  shift
+fi
+
 mkdir -p "$HOME_DIR/.config/opencode" "$PLUGIN_DIR/resources" "$STATE" "$WORK" \
   "$TUNNEL_DIR" "$ROOT/mint" "$ROOT/bin" 2>/dev/null || true
 
@@ -256,7 +265,7 @@ status() {
   echo "relay       : $(curl -s -m 5 "http://127.0.0.1:$RELAY_PORT/relay-health" 2>/dev/null || echo DOWN)"
   echo "tunnel      : $(curl -s -m 8 -x "http://127.0.0.1:$TUNNEL_PORT" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(ip|warp)=' | tr '\n' ' ' || echo 'none (native egress)')"
   echo "db          : $HOME_DIR/.local/share/opencode/opencode.db"
-  echo "project     : $WORK"
+  echo "project     : $TARGET"
   echo "runtime     : $OPENCODE_BIN"
   if [ -n "$MODEL_ID" ]; then
     echo "model       : $MODEL_ID"
@@ -280,12 +289,12 @@ case "${1:-tui}" in
   shell)
     use_relay
     use_tunnel || use_native
-    cd "$WORK" && exec "${SHELL:-bash}"
+    cd "$TARGET" && exec "${SHELL:-bash}"
     ;;
   serve)
     use_relay
     use_tunnel || use_native
-    cd "$WORK" && exec "$OPENCODE_BIN" serve --stdio
+    cd "$TARGET" && exec "$OPENCODE_BIN" serve --stdio
     ;;
   run)
     use_relay
@@ -294,12 +303,12 @@ case "${1:-tui}" in
     # --standalone: without it the CLI attaches to an ALREADY RUNNING
     # background service, so the session lands in THAT instance's DB and the
     # traffic rides THAT instance's proxy. This is what keeps sajilo separate.
-    cd "$WORK" && exec "$OPENCODE_BIN" run --standalone "$@"
+    cd "$TARGET" && exec "$OPENCODE_BIN" run --standalone "$@"
     ;;
   tui|"")
     use_relay
     use_tunnel || use_native
-    cd "$WORK" && exec "$OPENCODE_BIN" --standalone
+    cd "$TARGET" && exec "$OPENCODE_BIN" --standalone
     ;;
   direct)
     # Opt out of the relay: the opencode client talks to the gateway directly
@@ -307,11 +316,11 @@ case "${1:-tui}" in
     use_direct
     use_tunnel || use_native
     shift
-    cd "$WORK" && exec "$OPENCODE_BIN" --standalone "$@"
+    cd "$TARGET" && exec "$OPENCODE_BIN" --standalone "$@"
     ;;
   *)
     use_relay
     use_tunnel || use_native
-    cd "$WORK" && exec "$OPENCODE_BIN" --standalone "$@"
+    cd "$TARGET" && exec "$OPENCODE_BIN" --standalone "$@"
     ;;
 esac

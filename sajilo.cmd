@@ -119,7 +119,16 @@ if not exist "%STATE%\stock-identity" (
   set "OPENCODE_CLI_CONFIG_CONTENT={"terminal":{"title":false},"highlights":false,"mini":{"splash":"hide"}}"
 )
 
-REM --- point the runtime at the sajilo relay --------------------------------
+REM --- where to run ------------------------------------------------------------
+REM Sajilo opens in the directory you are standing in, or the one you name -
+REM exactly like opencode does. The isolation comes from the HOME (own DB,
+REM own sessions, own config), never from the project directory.
+set "TARGET=%CD%"
+if not "%~1"=="" if exist "%~1\" (
+  set "TARGET=%~f1"
+  shift
+)
+
 REM A provider of OUR OWN instead of the built-in "opencode" one: the TUI then
 REM shows Sajilo next to the model instead of OpenCode, and /model offers
 REM exactly the free pool the relay can serve.
@@ -139,22 +148,50 @@ if /i "%~1"=="status" (
   echo root       : %ROOT%
   echo relay      : http://127.0.0.1:%RELAY_PORT%/relay-health
   echo db         : %HOME_DIR%\.local\share\opencode\opencode.db
-  echo project    : %WORK%
+  echo project    : %TARGET%
   echo runtime    : %OPENCODE_BIN%
   if "%MODEL_ID%"=="" (echo model       : auto ^(the relay rotates the free pool^)) else (echo model       : %MODEL_ID%)
   echo tunnel     : none on Windows ^(native egress^)
   exit /b 0
 )
 
-cd /d "%WORK%"
 if /i "%~1"=="rebrand" goto :do_rebrand
 if /i "%~1"=="model" goto :do_model
 if /i "%~1"=="run" goto :do_run
-if /i "%~1"=="shell" (
-  cmd /k
-  exit /b 0
-)
-"%OPENCODE_BIN%" --standalone %*
+if /i "%~1"=="shell" goto :do_shell
+if /i "%~1"=="direct" goto :do_direct
+goto :do_tui
+
+REM --- shell: a shell with the sajilo environment -----------------------------
+:do_shell
+cd /d "%TARGET%"
+cmd /k
+exit /b 0
+
+REM --- direct: talk to the gateway without the relay --------------------------
+:do_direct
+cd /d "%TARGET%"
+set "ARGS="
+:do_direct_next
+if "%~1"=="" goto :do_direct_exec
+set "ARGS=%ARGS% "%~1""
+shift
+goto :do_direct_next
+:do_direct_exec
+"%OPENCODE_BIN%" --standalone%ARGS%
+exit /b %errorlevel%
+
+REM --- the TUI, in the directory you are standing in ---------------------------
+:do_tui
+cd /d "%TARGET%"
+set "ARGS="
+:do_tui_next
+if "%~1"=="" goto :do_tui_exec
+set "ARGS=%ARGS% "%~1""
+shift
+goto :do_tui_next
+:do_tui_exec
+"%OPENCODE_BIN%" --standalone%ARGS%
 exit /b %errorlevel%
 
 REM --- rebrand: the identity of this instance --------------------------------
@@ -200,6 +237,7 @@ REM one at a time, each on its own line so every SHIFT is seen immediately.
 REM Each argument is re-quoted so spacing and inner quotes survive intact.
 :do_run
 shift
+cd /d "%TARGET%"
 set "ARGS="
 :do_run_next
 if "%~1"=="" goto :do_run_exec

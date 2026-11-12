@@ -86,6 +86,29 @@ sajilo run "hi"     # headless
 sajilo status       # what is running
 ```
 
+### Wherever you are
+
+Sajilo opens in **the directory you are standing in** - not in some private
+folder - so it works on the project you are actually looking at:
+
+```bash
+cd ~/projects/my-app
+sajilo                            # the TUI, in my-app
+sajilo ../other-repo              # or in the directory you name
+sajilo run "fix the failing test" # one prompt, right here
+```
+
+The isolation never depended on the directory: it comes from the HOME. The
+instance keeps its own database, its own sessions, its own config, its own
+relay and its own ports, whatever you point it at. The project directory only
+decides *what you are working on*.
+
+One caveat worth knowing: opencode reads a project-level `opencode.json` next
+to the code you open, and that file wins over the instance config for the
+keys it sets. If a project pins a model, sajilo follows it (the relay follows
+whatever the harness asks for). If a project redirects the provider's
+`baseURL`, that redirect wins too - delete it, or use `sajilo direct` there.
+
 ## The harness spec
 
 `plugin/resources/agent-prompt.txt` is Sajilo's system prompt and
