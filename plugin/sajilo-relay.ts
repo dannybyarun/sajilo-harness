@@ -223,10 +223,17 @@ function transformBody(raw: string): string {
       rest.push(m)
     }
   }
-  const rewritten: Array<Record<string, unknown>> = [
-    { role: "system", content: AGENT_PROMPT },
-  ]
-  if (systems.length) {
+  const rewritten: Array<Record<string, unknown>> = []
+  // SAJILO_RELAY_HARNESS=caller keeps the CALLER's own system prompt instead
+  // of injecting Sajilo's. The gateway accepts a request with the harness
+  // prompt alone, so a third-party agent can bring its own brain - it just
+  // has to be the shape the gateway approves.
+  if (env("RELAY_HARNESS")?.toLowerCase() === "caller" && systems.length > 0) {
+    rewritten.push({ role: "system", content: systems.join("\n\n---\n\n") })
+  } else {
+    rewritten.push({ role: "system", content: AGENT_PROMPT })
+  }
+  if (systems.length && env("RELAY_HARNESS")?.toLowerCase() !== "caller") {
     rewritten.push({
       role: "user",
       content:
@@ -255,7 +262,19 @@ function transformBody(raw: string): string {
         return true
       })
     : []
-  const mergedTools = [...AGENT_TOOLS, ...callerTools]
+  // The 12-tool set is the gateway's agent-class fingerprint, but it is also
+  // ~14 KB of every request - and the free allowance is weight-based. A
+  // third-party agent that brings its own toolset can therefore run lean:
+  // SAJILO_RELAY_TOOLS=caller drops the harness tools and sends only the
+  // caller's. Verified against the gateway: a request with the harness prompt
+  // and the caller's tools alone is accepted.
+  const lean = env("RELAY_TOOLS")?.toLowerCase() === "caller"
+  const mergedTools = lean && callerTools.length > 0 ? callerTools : [...AGENT_TOOLS, ...callerTools]
+  if (lean && callerTools.length > 0) {
+    logActivity(
+      `[${new Date().toISOString()}] TOOLS lean mode: ${callerTools.length} caller tools only (the harness toolset is not appended)`,
+    )
+  }
   parsed.messages = rewritten
   parsed.tools = mergedTools
   delete parsed.max_tokens
@@ -868,6 +887,9 @@ function startServer(): void {
             pid: process.pid,
             port: PORT,
             bind: BIND,
+            harness: env("RELAY_HARNESS")?.toLowerCase() === "caller" ? "caller" : "sajilo",
+            tools: env("RELAY_TOOLS")?.toLowerCase() === "caller" ? "caller" : "sajilo",
+            auth: TOKEN ? "token" : "open",
           })
         }
         // A token, when set, is required on everything but the health probe.

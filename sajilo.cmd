@@ -169,6 +169,17 @@ goto :do_tui
 
 REM --- relay: the provider on its own, for other agents ---------------------
 :do_relay
+REM --lean: a third-party agent's own prompt and tools only - no harness
+REM footprint. The free allowance is weight-based, so a lean relay fits
+REM requests a full one does not.
+set "LEAN="
+for %%A in (%*) do (
+  if /i "%%~A"=="--lean" set "LEAN=1"
+)
+if "%LEAN%"=="1" (
+  set "SAJILO_RELAY_TOOLS=caller"
+  set "SAJILO_RELAY_HARNESS=caller"
+)
 where bun >nul 2>&1
 if errorlevel 1 goto :relay_nobun
 bun run "%ROOT%\bin\sajilo-relay.ts"

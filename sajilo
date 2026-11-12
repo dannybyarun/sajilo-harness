@@ -286,6 +286,15 @@ case "${1:-tui}" in
     ;;
   relay)
     # The provider on its own, for other agents.
+    # --lean: the caller's own prompt and tools only - no harness footprint.
+    # The free allowance is weight-based, so a lean relay fits requests a
+    # full one does not.
+    for a in "$@"; do
+      if [ "$a" = "--lean" ]; then
+        export SAJILO_RELAY_TOOLS=caller
+        export SAJILO_RELAY_HARNESS=caller
+      fi
+    done
     if ! command -v bun >/dev/null 2>&1; then
       echo "sajilo relay needs bun (https://bun.sh) - install it, or keep a sajilo" >&2
       echo "session open: the relay runs inside every sajilo instance." >&2

@@ -90,7 +90,6 @@ sajilo status       # what is running
 
 Sajilo opens in **the directory you are standing in** - not in some private
 folder - so it works on the project you are actually looking at:
-
 ```bash
 cd ~/projects/my-app
 sajilo                            # the TUI, in my-app
@@ -265,6 +264,37 @@ What is verified working through that endpoint:
 Both paths work: `/v1/...` (what every SDK appends to a base URL) and
 `/openai/v1/...`.
 
+### Two ways to be a provider
+
+```bash
+sajilo relay            # the other agent gets SAJILO's brain (harness + tools)
+sajilo relay --lean     # the other agent keeps ITS OWN brain, 40% lighter
+```
+
+The default makes Sajilo the harness: your agent's requests are rewritten
+into Sajilo's agent class (its prompt, its 12-tool set) with the caller's own
+tools appended - the tools still work, the voice is Sajilo's.
+
+`--lean` is the other way round: the caller's own system prompt and toolset
+go upstream untouched, and none of Sajilo's footprint is added. Measured on a
+real third-party agent, that is a **48 KB request down to 30 KB** - and the
+free allowance is weight-based, so a lighter request is a request that still
+fits when the window is nearly empty.
+
+Which one to use:
+
+- you want the other agent to behave like Sajilo -> default
+- you want the other agent to behave like *itself* -> `--lean`
+
+### The free tier is the real limit
+
+The gateway's free allowance is a rolling window, and it is **weighted by the
+request**: a small request fits when a big one does not. A third-party agent
+with a full toolset (19 tool schemas, tens of KB of prompt) can exhaust the
+window that a one-tool agent uses comfortably. When it is empty, the relay
+tries all eleven free models and answers with the real 429 - the caller sees
+the gateway's own error, in the gateway's own words.
+
 ### From another machine
 
 The relay listens on `127.0.0.1` by default, so it serves this machine (every
@@ -282,6 +312,8 @@ account's free quota, and the relay refuses to bind without one.
 Clients that speak the **Anthropic** shape (`/v1/messages`) need a translator
 in front: the relay is OpenAI-shaped only. Point them at the OpenAI endpoint
 through a converter, or use an agent that speaks OpenAI.
+
+## Platform matrix
 
 ## Platform matrix
 
