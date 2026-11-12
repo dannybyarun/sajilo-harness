@@ -48,6 +48,13 @@ if [ -z "${SAJILO_BIN:-}" ] && [ -z "${OPENCODE_BIN:-}" ]; then
     fi
   done
 fi
+# A rebranded runtime ("sajilo rebrand") is this instance's own patched copy
+# and wins over everything else - it is the only way to change the welcome art
+# without touching the opencode the rest of the machine uses.
+if [ -z "${OPENCODE_BIN:-}" ] && [ -f "$STATE/rebrand.txt" ]; then
+  _rb=$(head -n 1 "$STATE/rebrand.txt" 2>/dev/null | tr -d '\r' || true)
+  [ -n "$_rb" ] && [ -x "$_rb" ] && SAJILO_BIN="$_rb"
+fi
 OPENCODE_BIN=${SAJILO_BIN:-${OPENCODE_BIN:-opencode}}
 RESOURCES_DIR="$ROOT/resources"
 
@@ -68,6 +75,8 @@ fi
 if [ -z "$MODEL_ID" ] && [ -z "$MODEL_AUTO" ]; then
   MODEL_ID="deepseek-v4.1-flash-free"
 fi
+PROVIDER_PREFIX=sajilo
+[ -f "$STATE/stock-identity" ] && PROVIDER_PREFIX=opencode
 
 mkdir -p "$HOME_DIR/.config/opencode" "$PLUGIN_DIR/resources" "$STATE" "$WORK" \
   "$TUNNEL_DIR" "$ROOT/mint" "$ROOT/bin" 2>/dev/null || true
@@ -75,6 +84,7 @@ mkdir -p "$HOME_DIR/.config/opencode" "$PLUGIN_DIR/resources" "$STATE" "$WORK" \
 # ---------------------------------------------------------------- environment
 export HOME="$HOME_DIR"
 export USERPROFILE="$HOME_DIR" 2>/dev/null || true   # Bun on Windows
+export SAJILO_ROOT="$ROOT"
 export SAJILO_RELAY_PORT="$RELAY_PORT"
 export SAJILO_RELAY_DIR="$PLUGIN_DIR"
 export SAJILO_RELAY_MINT_DIR="$ROOT/mint"
@@ -91,8 +101,13 @@ export SAJILO_RELAY_MODEL_FILE="$MODEL_FILE"
 #   highlights false     -> no update dialog on start
 #   mini.splash hide     -> no entry/exit splash banner
 # The provider in the config above is what the TUI prints next to the model
-# (Sajilo, not OpenCode).
-export OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false,"mini":{"splash":"hide"}}'
+# (Sajilo, not OpenCode). "sajilo rebrand --restore" drops the stock marker:
+# this instance goes back to the stock opencode identity.
+if [ -f "$STATE/stock-identity" ]; then
+  unset OPENCODE_CLI_CONFIG_CONTENT
+else
+  export OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false,"mini":{"splash":"hide"}}'
+fi
 export SAJILO_RELAY_ROTATOR="$ROOT/bin/warp-rotate.sh"
 export SAJILO_RELAY_WATCHDOG="$ROOT/bin/tunnel-watchdog.sh"
 export SAJILO_ROTATE_MARKER="$STATE/.rotate.inprogress"
@@ -157,11 +172,26 @@ use_relay() {
   # changing the model in the harness changes what the relay sends upstream.
   local model_json=""
   if [ -n "$MODEL_ID" ]; then
-    model_json=",\"model\":\"sajilo/$MODEL_ID\""
+    model_json=",\"model\":\"$PROVIDER_PREFIX/$MODEL_ID\""
   fi
   # A provider of OUR OWN instead of the built-in "opencode" one: the TUI then
   # shows Sajilo next to the model instead of OpenCode, and /model offers
   # exactly the free pool the relay can serve.
+  if [ -f "$STATE/stock-identity" ]; then
+    cat >"$HOME_DIR/.config/opencode/opencode.json" <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json"$model_json,
+  "provider": {
+    "opencode": {
+      "options": {
+        "baseURL": "http://127.0.0.1:$RELAY_PORT/openai/v1"
+      }
+    }
+  }
+}
+EOF
+    return
+  fi
   cat >"$HOME_DIR/.config/opencode/opencode.json" <<EOF
 {
   "\$schema": "https://opencode.ai/config.json"$model_json,
@@ -239,6 +269,10 @@ status() {
 
 case "${1:-tui}" in
   status) status ;;
+  rebrand)
+    shift
+    exec bash "$(dirname "$0")/sajilo-rebrand.sh" "$@"
+    ;;
   model)
     shift
     model_cmd "${1:-}"

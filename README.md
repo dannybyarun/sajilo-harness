@@ -162,9 +162,31 @@ not the built-in `opencode` one - which is what the TUI prints next to the
 model. The CLI settings are injected inline, so the terminal title stops
 saying "OpenCode" and the update dialog stays out of the way.
 
-The one piece that stays is the runtime's welcome art - the big word drawn on
-the start screen is baked into the opencode binary and no supported setting
-replaces it.
+### `sajilo rebrand`
+
+The identity is applied automatically, but you can drive it by hand:
+
+```bash
+sajilo rebrand            # apply the Sajilo identity
+sajilo rebrand --status   # what is branded right now
+sajilo rebrand --restore  # back to the stock opencode identity
+```
+
+```
+rebrand: identity -> Sajilo
+  provider name      : Sajilo
+  terminal title     : off (no OpenCode in the tab)
+  update dialog      : off
+  splash banner      : off
+  welcome wordmark   : the runtime's own art - not replaceable
+```
+
+One piece stays: the runtime's welcome art - the big word drawn on the start
+screen. It is a compressed asset inside the opencode binary, and no supported
+setting replaces it. Patching it would mean a private copy of the runtime
+(a ~250 MB binary the instance owns) plus surgery on the compressed asset,
+and it would be lost on every opencode update - so it is not done behind your
+back.
 
 ## Platform matrix
 

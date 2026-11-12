@@ -15,6 +15,10 @@ REM Delayed expansion stays OFF on purpose: it would eat "!" characters that
 REM belong to the prompt passed to "sajilo run ...".
 setlocal DisableDelayedExpansion
 
+REM Capture our own directory NOW: after a SHIFT, %~dp0 stops pointing at
+REM this script and resolves to the caller's directory instead.
+set "SELF_DIR=%~dp0"
+
 if "%SAJILO_ROOT%"=="" (
   set "ROOT=%USERPROFILE%\.sajilo"
 ) else (
@@ -42,6 +46,12 @@ REM never break this launcher.
 if exist "%STATE%\sajilo-bin.txt" (
   for /f "usebackq delims=" %%B in ("%STATE%\sajilo-bin.txt") do if exist "%%B" set "OPENCODE_BIN=%%B"
 )
+REM A rebranded runtime ("sajilo rebrand") is this instance's own patched copy
+REM and wins over everything else - it is the only way to change the welcome
+REM art without touching the opencode the rest of the machine uses.
+if exist "%STATE%\rebrand.txt" (
+  for /f "usebackq delims=" %%R in ("%STATE%\rebrand.txt") do if exist "%%R" set "OPENCODE_BIN=%%R"
+)
 if "%OPENCODE_BIN%"=="" if "%SAJILO_BIN%"=="" set "OPENCODE_BIN=opencode"
 if "%OPENCODE_BIN%"=="" set "OPENCODE_BIN=%SAJILO_BIN%"
 
@@ -67,12 +77,15 @@ if /i "%MODEL_ID%"=="auto" (
   set "MODEL_AUTO=1"
 )
 if "%MODEL_ID%"=="" if not "%MODEL_AUTO%"=="1" set "MODEL_ID=deepseek-v4.1-flash-free"
+set "PROVIDER_PREFIX=sajilo"
+if exist "%STATE%\stock-identity" set "PROVIDER_PREFIX=opencode"
 set "MODEL_JSON="
-if not "%MODEL_ID%"=="" set "MODEL_JSON=,"model":"sajilo/%MODEL_ID%""
+if not "%MODEL_ID%"=="" set "MODEL_JSON=,"model":"%PROVIDER_PREFIX%/%MODEL_ID%""
 
 REM --- environment for the child only ---------------------------------------
 set "HOME=%HOME_DIR%"
 set "USERPROFILE=%HOME_DIR%"
+set "SAJILO_ROOT=%ROOT%"
 set "SAJILO_RELAY_PORT=%RELAY_PORT%"
 set "SAJILO_RELAY_DIR=%PLUGIN_DIR%"
 set "SAJILO_RELAY_MINT_DIR=%ROOT%\mint"
@@ -99,20 +112,27 @@ REM   highlights false     -> no update dialog on start
 REM   mini.splash hide     -> no entry/exit splash banner
 REM The provider in the config above is what the TUI prints next to the model
 REM (Sajilo, not OpenCode).
-set "OPENCODE_CLI_CONFIG_CONTENT={"terminal":{"title":false},"highlights":false,"mini":{"splash":"hide"}}"
+REM "sajilo rebrand --restore" drops the stock marker: this instance goes back
+REM to the stock opencode identity.
+set "OPENCODE_CLI_CONFIG_CONTENT="
+if not exist "%STATE%\stock-identity" (
+  set "OPENCODE_CLI_CONFIG_CONTENT={"terminal":{"title":false},"highlights":false,"mini":{"splash":"hide"}}"
+)
 
 REM --- point the runtime at the sajilo relay --------------------------------
 REM A provider of OUR OWN instead of the built-in "opencode" one: the TUI then
 REM shows Sajilo next to the model instead of OpenCode, and /model offers
 REM exactly the free pool the relay can serve.
 set "CFG=%HOME_DIR%\.config\opencode\opencode.json"
-if /i not "%~1"=="direct" (
+if /i "%~1"=="direct" (
+  if exist "%CFG%" del /q "%CFG%"
+) else if exist "%STATE%\stock-identity" (
+  >"%CFG%" echo {"$schema":"https://opencode.ai/config.json"%MODEL_JSON%,"provider":{"opencode":{"options":{"baseURL":"http://127.0.0.1:%RELAY_PORT%/openai/v1"}}}}
+) else (
   >"%CFG%" echo {"$schema":"https://opencode.ai/config.json"%MODEL_JSON%,"provider":{"sajilo":{"npm":"@ai-sdk/openai-compatible","name":"Sajilo","options":{"baseURL":"http://127.0.0.1:%RELAY_PORT%/openai/v1"},"models":{
   >>"%CFG%" echo "deepseek-v4.1-flash-free":{"name":"DeepSeek V4.1 Flash Free"},"glm-5.3-flash-free":{"name":"GLM 5.3 Flash Free"},"mimo-v2.6-flash-free":{"name":"MiMo v2.6 Flash Free"},"longcat-2.5-free":{"name":"LongCat 2.5"},
   >>"%CFG%" echo "iceman-free":{"name":"Iceman"},"inkling-2-small-free":{"name":"Inkling 2 Small"},"beam-free":{"name":"Beam"},"flint-40b-free":{"name":"Flint 40B"},
   >>"%CFG%" echo "nemotron-3.5-lightning-free":{"name":"Nemotron 3.5 Lightning"},"minimax-m3.1-flash-free":{"name":"MiniMax M3.1 Flash"},"nemotron-3.5-super-vl-free":{"name":"Nemotron 3.5 Super VL"}}}}}
-) else (
-  if exist "%CFG%" del /q "%CFG%"
 )
 
 if /i "%~1"=="status" (
@@ -127,6 +147,7 @@ if /i "%~1"=="status" (
 )
 
 cd /d "%WORK%"
+if /i "%~1"=="rebrand" goto :do_rebrand
 if /i "%~1"=="model" goto :do_model
 if /i "%~1"=="run" goto :do_run
 if /i "%~1"=="shell" (
@@ -135,6 +156,18 @@ if /i "%~1"=="shell" (
 )
 "%OPENCODE_BIN%" --standalone %*
 exit /b %errorlevel%
+
+REM --- rebrand: the identity of this instance --------------------------------
+:do_rebrand
+shift
+if not exist "%SELF_DIR%sajilo-rebrand.ps1" goto :rebrand_missing
+REM "%*" is not affected by SHIFT, so the arguments are passed one by one
+REM (these lines are parsed after the shift, so %1 is the first real option).
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SELF_DIR%sajilo-rebrand.ps1" %1 %2 %3 %4 %5 %6 %7 %8 %9
+exit /b %errorlevel%
+:rebrand_missing
+echo rebrand: bin\sajilo-rebrand.ps1 is missing - reinstall sajilo
+exit /b 1
 
 REM --- model: one pin file, honoured by the runtime AND the relay -----------
 :do_model

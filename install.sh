@@ -99,11 +99,11 @@ fi
 # ---------------------------------------------------------------- launcher
 if [ -n "$HERE" ] && [ -f "$HERE/sajilo" ]; then
   cp -f "$HERE/sajilo" "$BIN_DIR/sajilo"
-  for f in warp-rotate.sh tunnel-watchdog.sh; do
+  for f in warp-rotate.sh tunnel-watchdog.sh sajilo-rebrand.sh sajilo-rebrand.ps1; do
     [ -f "$HERE/bin/$f" ] && cp -f "$HERE/bin/$f" "$BIN_DIR/"
   done
 elif curl -fsSL "$REPO_URL/sajilo" -o "$BIN_DIR/sajilo"; then
-  for f in warp-rotate.sh tunnel-watchdog.sh; do
+  for f in warp-rotate.sh tunnel-watchdog.sh sajilo-rebrand.sh sajilo-rebrand.ps1; do
     curl -fsSL "$REPO_URL/bin/$f" -o "$BIN_DIR/$f" 2>/dev/null || true
   done
 else
