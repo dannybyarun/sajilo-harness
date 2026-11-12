@@ -115,6 +115,28 @@ try {
   warn(`live harness unreadable: ${e}`)
 }
 
+// --- the egress -------------------------------------------------------------
+// The free allowance is keyed on the exit IP, so the egress matters: a second
+// egress is a second bucket.
+console.log("\negress")
+const proxy = process.env.SAJILO_RELAY_PROXY ?? ""
+if (proxy) {
+  ok(`proxied leg: ${proxy} - a drained bucket can be climbed over`)
+  try {
+    const r = await fetch("https://www.cloudflare.com/cdn-cgi/trace", {
+      signal: AbortSignal.timeout(8000),
+    })
+    const t = await r.text()
+    const warp = /warp=(\w+)/.exec(t)?.[1]
+    const ip = /ip=([^\n\r]+)/.exec(t)?.[1]
+    ok(`exit through the proxy: ip=${ip ?? "?"} warp=${warp ?? "?"}`)
+  } catch (e) {
+    warn(`the proxy is set but did not answer: ${e}`)
+  }
+} else {
+  warn("no proxied leg - only one exit IP, so one bucket")
+}
+
 // --- the gateway ------------------------------------------------------------
 // The real check: send the instance's own harness upstream and see if the
 // gateway accepts it. A 429 here means the harness was rejected, not that
@@ -172,12 +194,22 @@ if (health) {
 // --- the identity -----------------------------------------------------------
 console.log("\nidentity")
 try {
-  const cfg = JSON.parse(readFileSync(join(HOME_DIR, ".config", "opencode", "opencode.json"), "utf8"))
-  const providers = Object.keys(cfg.provider ?? {})
-  if (providers.includes("sajilo")) ok(`provider: ${providers.join(", ")}`)
-  else warn(`provider is ${providers.join(", ")} - the TUI will print that name instead of Sajilo`)
-  if (cfg.model) ok(`model: ${cfg.model}`)
-  else warn("no default model in the runtime config")
+  const cfgPath = ["opencode.json", "opencode.jsonc"]
+    .map((f) => join(HOME_DIR, ".config", "opencode", f))
+    .find((p) => existsSync(p))
+  if (!cfgPath) {
+    warn("no runtime config yet - the relay writes it on the first launch")
+  } else {
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8").replace(/^\uFEFF/, ""))
+    const providers = Object.keys(cfg.provider ?? cfg.providers ?? {})
+    if (providers.includes("sajilo")) ok(`provider: ${providers.join(", ")}`)
+    else warn(`provider is ${providers.join(", ")} - the TUI will print that name instead of Sajilo`)
+    if (cfg.model) ok(`model: ${cfg.model}`)
+    else warn("no default model in the runtime config")
+    const mcp = Object.keys(cfg.mcp?.servers ?? {})
+    if (mcp.length) ok(`mcp servers: ${mcp.join(", ")}`)
+    else warn("no MCP servers configured")
+  }
 } catch (e) {
   warn(`runtime config unreadable: ${e}`)
 }

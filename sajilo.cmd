@@ -101,7 +101,15 @@ REM No usque on Windows: the sajilo relay uses the device's native egress and
 REM has no proxy of its own, so it never shares a bucket with another opencode.
 set "HTTPS_PROXY="
 set "HTTP_PROXY="
-set "SAJILO_RELAY_PROXY="
+REM The proxied leg of the egress ladder. A second egress is a second quota
+REM bucket - the free allowance is keyed on the exit IP - so a drained bucket
+REM can be climbed over instead of answered. The Cloudflare WARP service
+REM (warp-svc.exe) listens on 127.0.0.1:40000 while WARP is on, and that is
+REM the local proxy to use. Whatever the user set is kept.
+if "%SAJILO_RELAY_PROXY%"=="" (
+  netstat -ano | findstr /R /C:"127.0.0.1:40000 .*LISTENING" >nul 2>&1
+  if not errorlevel 1 set "SAJILO_RELAY_PROXY=http://127.0.0.1:40000"
+)
 set "OPENCODE_RELAY_PROXY="
 set "NO_PROXY=127.0.0.1,localhost,::1"
 set "no_proxy=127.0.0.1,localhost,::1"

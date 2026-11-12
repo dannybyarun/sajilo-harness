@@ -121,8 +121,7 @@ else
   export OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false,"mini":{"splash":"hide"}}'
 fi
 export SAJILO_RELAY_ROTATOR="$ROOT/bin/warp-rotate.sh"
-export SAJILO_RELAY_WATCHDOG="$ROOT/bin/tunnel-watchdog.sh"
-export SAJILO_ROTATE_MARKER="$STATE/.rotate.inprogress"
+export SAJILO_RELAY_WATCHDOG="$ROOT/bin/tunnel-watchdog.sh"export SAJILO_ROTATE_MARKER="$STATE/.rotate.inprogress"
 
 tunnel_up() {
   curl -s -m 8 -x "http://127.0.0.1:$TUNNEL_PORT" \
@@ -130,6 +129,12 @@ tunnel_up() {
 }
 
 have_usque() { command -v usque >/dev/null 2>&1; }
+
+# Is the local Cloudflare WARP proxy listening? The WARP service
+# (warp-svc.exe) exposes it on 127.0.0.1:40000 while WARP is on.
+warp_proxy_up() {
+  (exec 3<>/dev/tcp/127.0.0.1/40000) >/dev/null 2>&1
+}
 
 start_tunnel() {
   have_usque || return 1
@@ -161,10 +166,17 @@ use_tunnel() {
 
 use_native() {
   # No tunnel (or none available): sajilo relay talks to the gateway through
-  # the device's native egress, with NO proxy of its own - so it never shares
-  # a bucket with an opencode that is proxying somewhere else.
+  # the device's native egress. The proxied leg of the egress ladder is still
+  # worth having when it exists: the free allowance is keyed on the exit IP, so
+  # a second egress is a second bucket and a drained one can be climbed over.
+  # The Cloudflare WARP service (warp-svc.exe) listens on 127.0.0.1:40000
+  # while WARP is on - that is the local proxy to use. Whatever the user set is
+  # kept.
   unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy ALL_PROXY all_proxy
-  unset SAJILO_RELAY_PROXY WARP_PROXY_PORT
+  unset WARP_PROXY_PORT
+  if [ -z "${SAJILO_RELAY_PROXY:-}" ] && warp_proxy_up; then
+    export SAJILO_RELAY_PROXY="http://127.0.0.1:40000"
+  fi
   export NO_PROXY="127.0.0.1,localhost,::1"
   export no_proxy="127.0.0.1,localhost,::1"
 }

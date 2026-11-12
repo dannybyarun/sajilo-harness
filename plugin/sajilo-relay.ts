@@ -642,30 +642,51 @@ function kickRescue(reason: string): boolean {
   // The rotator and the rescue log are per-instance: the sajilo instance must
   // rotate ITS OWN tunnel. A hardcoded path meant sajilo's rescue chain
   // rotated the LIVE tunnel.
-  const ROTATOR =
-    env("RELAY_ROTATOR") ?? "/usr/local/lib/opencode-warp/warp-rotate.sh"
+  //
+  // Windows has its own rotator: the opencode-warp stack ships
+  // warp-rotate.cmd (--rotate-only), and there is no --restart-only there.
+  const isWindows = process.platform === "win32"
+  const ROTATOR = isWindows
+    ? (env("RELAY_ROTATOR") ??
+      `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`)
+    : (env("RELAY_ROTATOR") ?? "/usr/local/lib/opencode-warp/warp-rotate.sh")
   const RESCUE_LOG =
     env("RELAY_RESCUE_LOG") ?? "/tmp/sajilo/rescue.log"
-  const script =
-    `echo "--- rescue ${new Date().toISOString()} (${reason}) egress-rotate=${rotateEgress} ---" >>${RESCUE_LOG}\n` +
-    (rotateEgress
-      ? // Restart FIRST, rotate second. The free bucket is keyed on the EXIT
-        // IP, not on the WARP account (measured 2026-11-11: the same
-        // account with a new exit IP recovered a drained model). A restart
-        // is cheap and keeps the working account; a re-enrollment is slow
-        // and can produce a brand-new account whose tunnel never comes up.
-        `${ROTATOR} --restart-only >>${RESCUE_LOG} 2>&1\n` +
-        `RC=$?\n` +
-        `echo "restart rc=$RC" >>${RESCUE_LOG}\n` +
-        `if [ "$RC" -ne 0 ]; then ${ROTATOR} --rotate-only >>${RESCUE_LOG} 2>&1; ` +
-        `echo "rotate rc=$?" >>${RESCUE_LOG}; fi\n`
-      : `echo "egress rotation SKIPPED (experiment mode: pair-mint only)" >>${RESCUE_LOG}\n`) +
-    // Mint via the relay's own loopback endpoint (no python3 dependency).
-    `curl -s -m 180 -X POST http://127.0.0.1:${PORT}/relay-mint ` +
-    `-H 'content-type: application/json' -d '{}' >>${RESCUE_LOG} 2>&1\n` +
-    `echo " mint: $?" >>${RESCUE_LOG}\n`
+  // The rescue script runs under bash on unix and cmd on windows.
+  const shell = isWindows ? "cmd.exe" : "bash"
+  const shellArgs = isWindows ? ["/c", script] : ["-c", script]
+  const script = isWindows
+    ? `@echo off\r\n` +
+      `echo --- rescue ${new Date().toISOString()} (${reason}) egress-rotate=${rotateEgress} --- >>"${RESCUE_LOG}"\r\n` +
+      (rotateEgress
+        ? // Windows: --rotate-only replaces the WARP registration (a new exit
+          // IP). There is no --restart-only in the Windows rotator.
+          `"${ROTATOR}" --rotate-only >>"${RESCUE_LOG}" 2>&1\r\n` +
+          `echo rotate rc=%errorlevel% >>"${RESCUE_LOG}"\r\n`
+        : `echo egress rotation SKIPPED (experiment mode: pair-mint only) >>"${RESCUE_LOG}"\r\n`) +
+      // Mint via the relay's own loopback endpoint (no python3 dependency).
+      `curl -s -m 180 -X POST http://127.0.0.1:${PORT}/relay-mint ` +
+      `-H "content-type: application/json" -d "{}" >>"${RESCUE_LOG}" 2>&1\r\n` +
+      `echo mint: %errorlevel% >>"${RESCUE_LOG}"\r\n`
+    : `echo "--- rescue ${new Date().toISOString()} (${reason}) egress-rotate=${rotateEgress} ---" >>${RESCUE_LOG}\n` +
+      (rotateEgress
+        ? // Restart FIRST, rotate second. The free bucket is keyed on the EXIT
+          // IP, not on the WARP account (measured 2026-11-11: the same
+          // account with a new exit IP recovered a drained model). A restart
+          // is cheap and keeps the working account; a re-enrollment is slow
+          // and can produce a brand-new account whose tunnel never comes up.
+          `${ROTATOR} --restart-only >>${RESCUE_LOG} 2>&1\n` +
+          `RC=$?\n` +
+          `echo "restart rc=$RC" >>${RESCUE_LOG}\n` +
+          `if [ "$RC" -ne 0 ]; then ${ROTATOR} --rotate-only >>${RESCUE_LOG} 2>&1; ` +
+          `echo "rotate rc=$?" >>${RESCUE_LOG}; fi\n`
+        : `echo "egress rotation SKIPPED (experiment mode: pair-mint only)" >>${RESCUE_LOG}\n`) +
+      // Mint via the relay's own loopback endpoint (no python3 dependency).
+      `curl -s -m 180 -X POST http://127.0.0.1:${PORT}/relay-mint ` +
+      `-H 'content-type: application/json' -d '{}' >>${RESCUE_LOG} 2>&1\n` +
+      `echo " mint: $?" >>${RESCUE_LOG}\n`
   try {
-    const proc = Bun.spawn(["bash", "-c", script], {
+    const proc = Bun.spawn([shell, ...shellArgs], {
       stdout: "ignore",
       stderr: "ignore",
       stdin: "ignore",
@@ -1341,6 +1362,22 @@ function startServer(): void {
                     },
                     egress === "direct",
                   )
+                  // A 429 from the proxied leg means THAT BUCKET is drained -
+                  // not that the model is. The native egress is a different
+                  // bucket (its own exit IP) and can still have room, so keep
+                  // climbing the ladder instead of answering the 429.
+                  if (resp.status === 429 && egress === "proxy" && egressLadder().length > 1) {
+                    logActivity(
+                      `[${new Date().toISOString()}] SPIN 429 via the proxied egress (${m}): that bucket is drained - trying the native egress`,
+                    )
+                    try {
+                      await resp.body?.cancel()
+                    } catch {
+                      /* ignore */
+                    }
+                    resp = null
+                    continue
+                  }
                   break
                 } catch (e) {
                   finalStatus = 0
