@@ -102,6 +102,8 @@ export SAJILO_RELAY_UPSTREAM_FILE="$STATE/relay-upstream.txt"
 export SAJILO_RELAY_DIRECT_EGRESS_FLAG="$STATE/direct-egress"
 export SAJILO_RELAY_RESCUE_LOG="$STATE/rescue.log"
 export SAJILO_RELAY_MODEL_FILE="$MODEL_FILE"
+export SAJILO_RELAY_DUMP_DIR="$STATE"
+export SAJILO_RELAY_RUNTIME="$OPENCODE_BIN"
 
 # The TUI's own identity. The runtime draws its product name in the window
 # title and the splash banner; these CLI settings are injected inline

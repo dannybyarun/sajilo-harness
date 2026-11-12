@@ -102,6 +102,9 @@ const ROTATE_MARKER =
 // Scratch dir where the mint spawns its opencode run. Per-instance so two
 // relays never share a scratch dir.
 const MINT_DIR = env("RELAY_MINT_DIR") ?? "/root/sajilo-mint"
+// Where the full request/response dumps land (diagnostics, not the activity
+// log - that one truncates).
+const DUMP_DIR = env("RELAY_DUMP_DIR") ?? "/tmp/sajilo"
 // Per-instance runtime upstream override file (the sajilo instance has its own).
 const RELAY_UPSTREAM_FILE =
   env("RELAY_UPSTREAM_FILE") ?? "/tmp/sajilo/relay-upstream.txt"
@@ -338,6 +341,16 @@ function modelPin(): string | null {
     /* no pin file — the runtime's own choice is used */
   }
   return null
+}
+
+/**
+ * The opencode runtime to use for a minted session. Resolved instead of
+ * hardcoded, so the rescue chain works on every platform.
+ */
+function runtimeBin(): string {
+  const explicit = env("RELAY_RUNTIME") ?? process.env.OPENCODE_BIN
+  if (explicit) return explicit
+  return process.platform === "win32" ? "opencode.cmd" : "opencode"
 }
 
 /**
@@ -695,16 +708,22 @@ async function mintOnce(prompt?: string, force = false): Promise<Record<string, 
     // harvester filters that dir out, so the mint could never find its own
     // session. With --standalone the child runs its own server rooted at the
     // scratch dir, so the session id + project id are a fresh, eligible pair.
-    const proc = Bun.spawn(
-      ["/root/.opencode/bin/opencode", "run", "--standalone", prompt ?? MINT_PROMPT],
-      {
-        cwd: dir,
-        stdout: "pipe",
-        stderr: "pipe",
-        stdin: "ignore",
-        env,
-      },
-    )
+    //
+    // The runtime is resolved, not hardcoded: the old build pointed at the
+    // Android lab's /root/.opencode/bin/opencode, which exists nowhere else.
+    const bin = runtimeBin()
+    const mintArgs = ["run", "--standalone", prompt ?? MINT_PROMPT]
+    const cmd =
+      process.platform === "win32" && bin.toLowerCase().endsWith(".cmd")
+        ? ["cmd.exe", "/c", bin, ...mintArgs]
+        : [bin, ...mintArgs]
+    const proc = Bun.spawn(cmd, {
+      cwd: dir,
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+      env,
+    })
     let childTail = ""
     const childOut = proc.stdout.getReader()
     const drain = (async () => {
@@ -949,11 +968,14 @@ function startServer(): void {
           callerStreamWants.set(req, wantStream)
           transformed = transformBody(raw)
           // Full-body dumps for offline bisecting (the activity log truncates).
+          // They land in the instance's own state dir, not in /tmp - on
+          // Windows there is no /tmp, so the dumps used to vanish.
           try {
-            writeFileSync("/tmp/sajilo/relay-last-incoming.json", raw)
-            writeFileSync("/tmp/sajilo/relay-last-transformed.json", transformed)
+            mkdirSync(DUMP_DIR, { recursive: true })
+            writeFileSync(`${DUMP_DIR}/relay-last-incoming.json`, raw)
+            writeFileSync(`${DUMP_DIR}/relay-last-transformed.json`, transformed)
             writeFileSync(
-              "/tmp/sajilo/relay-last-meta.txt",
+              `${DUMP_DIR}/relay-last-meta.txt`,
               `${new Date().toISOString()}\npathname: ${url.pathname}\n` +
                 `model: ${(JSON.parse(raw) as { model?: string }).model ?? "?"}\n` +
                 `incoming: ${raw.length}B, transformed: ${transformed.length}B\n`,

@@ -94,6 +94,8 @@ set "SAJILO_RELAY_UPSTREAM_FILE=%STATE%\relay-upstream.txt"
 set "SAJILO_RELAY_DIRECT_EGRESS_FLAG=%STATE%\direct-egress"
 set "SAJILO_RELAY_RESCUE_LOG=%STATE%\rescue.log"
 set "SAJILO_RELAY_MODEL_FILE=%MODEL_FILE%"
+set "SAJILO_RELAY_DUMP_DIR=%STATE%"
+set "SAJILO_RELAY_RUNTIME=%OPENCODE_BIN%"
 set "SAJILO_ROTATE_MARKER=%STATE%\.rotate.inprogress"
 REM No usque on Windows: the sajilo relay uses the device's native egress and
 REM has no proxy of its own, so it never shares a bucket with another opencode.
