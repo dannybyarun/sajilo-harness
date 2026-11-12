@@ -76,7 +76,23 @@ function Get-ReleaseBundle {
 $localPlugin = if ($Here) { Join-Path $Here "plugin\sajilo-relay.ts" } else { "" }
 if ($localPlugin -and (Test-Path $localPlugin)) {
   Copy-Item $localPlugin (Join-Path $PluginDir "sajilo-relay.ts") -Force
-  Copy-Item (Join-Path $Here "plugin\resources\*") (Join-Path $PluginDir "resources") -Force
+  # The harness spec (prompt + tools) is the USER'S. Never overwrite it: the
+  # gateway checks the prompt's structure, so a clobbered spec can silently
+  # break the harness (every request 429s). A new spec is only installed when
+  # the instance does not have one yet.
+  foreach ($r in @("agent-prompt.txt", "agent-tools.json", "title-prompt.txt")) {
+    $src = Join-Path $Here "plugin\resources\$r"
+    $dst = Join-Path $PluginDir "resources\$r"
+    if (-not (Test-Path $src)) { continue }
+    if (Test-Path $dst) {
+      if ((Get-FileHash $src).Hash -ne (Get-FileHash $dst).Hash) {
+        Copy-Item $dst "$dst.bak" -Force
+        Say "kept your harness spec ($r) - the new one is at $dst.bak"
+      }
+      continue
+    }
+    Copy-Item $src $dst -Force
+  }
   Say "relay plugin installed -> $PluginDir"
 } else {
   Say "relay plugin not found next to the installer - downloading it"
@@ -120,7 +136,7 @@ if ($launcherSrc -and (Test-Path $launcherSrc)) {
   }
 }
 if ($Here) {
-  foreach ($f in @("warp-rotate.sh", "tunnel-watchdog.sh", "sajilo-rebrand.sh", "sajilo-rebrand.ps1", "sajilo-relay.ts")) {
+  foreach ($f in @("warp-rotate.sh", "tunnel-watchdog.sh", "sajilo-rebrand.sh", "sajilo-rebrand.ps1", "sajilo-relay.ts", "sajilo-doctor.ts")) {
     $p = Join-Path $Here "bin\$f"
     if (Test-Path $p) { Copy-Item $p (Join-Path $BinDir $f) -Force }
   }

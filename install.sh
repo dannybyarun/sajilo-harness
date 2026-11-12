@@ -77,7 +77,23 @@ fetch_bundle() {
 
 if [ -n "$HERE" ] && [ -f "$HERE/plugin/sajilo-relay.ts" ]; then
   cp -f "$HERE/plugin/sajilo-relay.ts" "$PLUGIN_DIR/"
-  cp -f "$HERE"/plugin/resources/* "$PLUGIN_DIR/resources/" 2>/dev/null || true
+  # The harness spec (prompt + tools) is the USER'S. Never overwrite it: the
+  # gateway checks the prompt's structure, so a clobbered spec can silently
+  # break the harness (every request 429s). A new spec is only installed when
+  # the instance does not have one yet.
+  for f in agent-prompt.txt agent-tools.json title-prompt.txt; do
+    src="$HERE/plugin/resources/$f"
+    dst="$PLUGIN_DIR/resources/$f"
+    [ -f "$src" ] || continue
+    if [ -f "$dst" ]; then
+      if ! cmp -s "$src" "$dst"; then
+        cp -f "$dst" "$dst.bak"
+        say "kept your harness spec ($f) - the new one is at $dst.bak"
+      fi
+      continue
+    fi
+    cp -f "$src" "$dst"
+  done
   say "relay plugin installed -> $PLUGIN_DIR"
 else
   say "relay plugin not found next to the installer - downloading it"
@@ -99,11 +115,11 @@ fi
 # ---------------------------------------------------------------- launcher
 if [ -n "$HERE" ] && [ -f "$HERE/sajilo" ]; then
   cp -f "$HERE/sajilo" "$BIN_DIR/sajilo"
-  for f in warp-rotate.sh tunnel-watchdog.sh sajilo-rebrand.sh sajilo-rebrand.ps1 sajilo-relay.ts; do
+  for f in warp-rotate.sh tunnel-watchdog.sh sajilo-rebrand.sh sajilo-rebrand.ps1 sajilo-relay.ts sajilo-doctor.ts; do
     [ -f "$HERE/bin/$f" ] && cp -f "$HERE/bin/$f" "$BIN_DIR/"
   done
 elif curl -fsSL "$REPO_URL/sajilo" -o "$BIN_DIR/sajilo"; then
-  for f in warp-rotate.sh tunnel-watchdog.sh sajilo-rebrand.sh sajilo-rebrand.ps1 sajilo-relay.ts; do
+  for f in warp-rotate.sh tunnel-watchdog.sh sajilo-rebrand.sh sajilo-rebrand.ps1 sajilo-relay.ts sajilo-doctor.ts; do
     curl -fsSL "$REPO_URL/bin/$f" -o "$BIN_DIR/$f" 2>/dev/null || true
   done
 else

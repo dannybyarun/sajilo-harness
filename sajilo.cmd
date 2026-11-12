@@ -159,6 +159,7 @@ if /i "%~1"=="status" (
 )
 
 if /i "%~1"=="rebrand" goto :do_rebrand
+if /i "%~1"=="doctor" goto :do_doctor
 if /i "%~1"=="relay" goto :do_relay
 if /i "%~1"=="model" goto :do_model
 if /i "%~1"=="run" goto :do_run
@@ -166,6 +167,16 @@ if /i "%~1"=="shell" goto :do_shell
 if /i "%~1"=="serve" goto :do_serve
 if /i "%~1"=="direct" goto :do_direct
 goto :do_tui
+
+REM --- doctor: is the harness and the relay healthy? -------------------------
+:do_doctor
+where bun >nul 2>&1
+if errorlevel 1 goto :doctor_nobun
+bun run "%ROOT%\bin\sajilo-doctor.ts"
+exit /b %errorlevel%
+:doctor_nobun
+echo sajilo doctor needs bun ^(https://bun.sh^)
+exit /b 1
 
 REM --- relay: the provider on its own, for other agents ---------------------
 :do_relay

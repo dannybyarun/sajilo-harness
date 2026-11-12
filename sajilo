@@ -284,6 +284,14 @@ case "${1:-tui}" in
     shift
     exec bash "$(dirname "$0")/sajilo-rebrand.sh" "$@"
     ;;
+  doctor)
+    # Is the harness and the relay healthy?
+    if ! command -v bun >/dev/null 2>&1; then
+      echo "sajilo doctor needs bun (https://bun.sh)" >&2
+      exit 1
+    fi
+    exec bun run "$BIN_DIR/sajilo-doctor.ts"
+    ;;
   relay)
     # The provider on its own, for other agents.
     # --lean: the caller's own prompt and tools only - no harness footprint.

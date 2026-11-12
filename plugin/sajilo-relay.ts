@@ -275,6 +275,23 @@ function transformBody(raw: string): string {
       `[${new Date().toISOString()}] TOOLS lean mode: ${callerTools.length} caller tools only (the harness toolset is not appended)`,
     )
   }
+  // A third-party agent can only execute the tools IT sent. The harness
+  // toolset is in the request (the gateway expects it), so the model can
+  // still see it - and a call the caller cannot run breaks the turn. Tell
+  // the model to stick to the caller's own tools.
+  const harnessNames = new Set(AGENT_TOOLS.map((t) => toolName(t)).filter(Boolean) as string[])
+  const foreignTools = callerTools.filter((t) => {
+    const n = toolName(t)
+    return !!n && !harnessNames.has(n)
+  })
+  if (foreignTools.length > 0) {
+    rewritten[0] = {
+      ...rewritten[0],
+      content: `${rewritten[0].content}\n\n# Tools\n- The caller of this request supplied its own tools (${foreignTools
+        .map((t) => toolName(t))
+        .join(", ")}). Use ONLY those - the other tools in this list belong to the harness and the caller cannot run them, so a call to one breaks the turn.`,
+    }
+  }
   parsed.messages = rewritten
   parsed.tools = mergedTools
   delete parsed.max_tokens
