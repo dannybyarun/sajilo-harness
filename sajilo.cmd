@@ -224,7 +224,6 @@ set "ARGS=%ARGS% "%~1""
 shift
 goto :do_tui_next
 :do_tui_exec
-echo DEBUG target=[%TARGET%] bin=[%OPENCODE_BIN%] args=[%ARGS%] cwd=[%CD%] 1>&2
 "%OPENCODE_BIN%" --standalone%ARGS%
 exit /b %errorlevel%
 
