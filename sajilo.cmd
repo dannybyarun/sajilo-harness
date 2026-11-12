@@ -50,6 +50,20 @@ if not exist "%STATE%" mkdir "%STATE%"
 if not exist "%WORK%" mkdir "%WORK%"
 if not exist "%ROOT%\mint" mkdir "%ROOT%\mint"
 
+REM --- the model the harness wants ------------------------------------------
+REM One pin file, read live by BOTH sides: "sajilo model <name>" writes it,
+REM the launcher puts it in the runtime config, and the relay honours the same
+REM file on every request. Change the model in the harness and the relay
+REM follows immediately - no restart, no second place to edit.
+REM (Read BEFORE the environment block below: it exports MODEL_FILE.)
+set "MODEL_FILE=%STATE%\model.txt"
+set "MODEL_ID="
+if exist "%MODEL_FILE%" (
+  for /f "usebackq delims=" %%M in ("%MODEL_FILE%") do set "MODEL_ID=%%M"
+)
+set "MODEL_JSON="
+if not "%MODEL_ID%"=="" set "MODEL_JSON=,"model":"opencode/%MODEL_ID%""
+
 REM --- environment for the child only ---------------------------------------
 set "HOME=%HOME_DIR%"
 set "USERPROFILE=%HOME_DIR%"
@@ -60,6 +74,7 @@ set "SAJILO_RELAY_ACTIVITY_LOG=%STATE%\relay-activity.log"
 set "SAJILO_RELAY_UPSTREAM_FILE=%STATE%\relay-upstream.txt"
 set "SAJILO_RELAY_DIRECT_EGRESS_FLAG=%STATE%\direct-egress"
 set "SAJILO_RELAY_RESCUE_LOG=%STATE%\rescue.log"
+set "SAJILO_RELAY_MODEL_FILE=%MODEL_FILE%"
 set "SAJILO_ROTATE_MARKER=%STATE%\.rotate.inprogress"
 REM No usque on Windows: the sajilo relay uses the device's native egress and
 REM has no proxy of its own, so it never shares a bucket with another opencode.
@@ -72,7 +87,7 @@ set "no_proxy=127.0.0.1,localhost,::1"
 
 REM --- point the runtime at the sajilo relay --------------------------------
 if /i not "%~1"=="direct" (
-  >"%HOME_DIR%\.config\opencode\opencode.json" echo {"$schema":"https://opencode.ai/config.json","provider":{"opencode":{"options":{"baseURL":"http://127.0.0.1:%RELAY_PORT%/openai/v1"}}}}
+  >"%HOME_DIR%\.config\opencode\opencode.json" echo {"$schema":"https://opencode.ai/config.json"%MODEL_JSON%,"provider":{"opencode":{"options":{"baseURL":"http://127.0.0.1:%RELAY_PORT%/openai/v1"}}}}
 ) else (
   if exist "%HOME_DIR%\.config\opencode\opencode.json" del /q "%HOME_DIR%\.config\opencode\opencode.json"
 )
@@ -83,11 +98,13 @@ if /i "%~1"=="status" (
   echo db         : %HOME_DIR%\.local\share\opencode\opencode.db
   echo project    : %WORK%
   echo runtime    : %OPENCODE_BIN%
+  if "%MODEL_ID%"=="" (echo model       : auto ^(the relay rotates the free pool^)) else (echo model       : %MODEL_ID%)
   echo tunnel     : none on Windows ^(native egress^)
   exit /b 0
 )
 
 cd /d "%WORK%"
+if /i "%~1"=="model" goto :do_model
 if /i "%~1"=="run" goto :do_run
 if /i "%~1"=="shell" (
   cmd /k
@@ -95,6 +112,30 @@ if /i "%~1"=="shell" (
 )
 "%OPENCODE_BIN%" --standalone %*
 exit /b %errorlevel%
+
+REM --- model: one pin file, honoured by the runtime AND the relay -----------
+:do_model
+shift
+if "%~1"=="" goto :model_show
+if /i "%~1"=="--auto" goto :model_clear
+if not exist "%STATE%" mkdir "%STATE%"
+>"%MODEL_FILE%" echo %~1
+echo model pinned  : %~1
+echo                 (the relay uses it on the next request; the free pool
+echo                  still covers it if that model is drained)
+goto :model_end
+:model_show
+if "%MODEL_ID%"=="" (
+  echo model        : auto ^(the relay rotates the free pool^)
+) else (
+  echo model        : %MODEL_ID%
+)
+goto :model_end
+:model_clear
+if exist "%MODEL_FILE%" del /q "%MODEL_FILE%"
+echo model        : auto ^(the relay rotates the free pool^)
+:model_end
+exit /b 0
 
 REM --- run: rebuild the argument list by hand --------------------------------
 REM "%*" is NOT affected by SHIFT in a batch file, so passing it after a

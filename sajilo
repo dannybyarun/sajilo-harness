@@ -51,6 +51,14 @@ fi
 OPENCODE_BIN=${SAJILO_BIN:-${OPENCODE_BIN:-opencode}}
 RESOURCES_DIR="$ROOT/resources"
 
+# The model pin: written by "sajilo model <name>", read by the launcher (for
+# the runtime config) and by the relay (for every upstream request).
+MODEL_FILE="$STATE/model.txt"
+MODEL_ID=""
+if [ -f "$MODEL_FILE" ]; then
+  MODEL_ID=$(head -n 1 "$MODEL_FILE" 2>/dev/null | tr -d '\r' || true)
+fi
+
 mkdir -p "$HOME_DIR/.config/opencode" "$PLUGIN_DIR/resources" "$STATE" "$WORK" \
   "$TUNNEL_DIR" "$ROOT/mint" "$ROOT/bin" 2>/dev/null || true
 
@@ -64,6 +72,7 @@ export SAJILO_RELAY_ACTIVITY_LOG="$STATE/relay-activity.log"
 export SAJILO_RELAY_UPSTREAM_FILE="$STATE/relay-upstream.txt"
 export SAJILO_RELAY_DIRECT_EGRESS_FLAG="$STATE/direct-egress"
 export SAJILO_RELAY_RESCUE_LOG="$STATE/rescue.log"
+export SAJILO_RELAY_MODEL_FILE="$MODEL_FILE"
 export SAJILO_RELAY_ROTATOR="$ROOT/bin/warp-rotate.sh"
 export SAJILO_RELAY_WATCHDOG="$ROOT/bin/tunnel-watchdog.sh"
 export SAJILO_ROTATE_MARKER="$STATE/.rotate.inprogress"
@@ -122,9 +131,17 @@ use_native() {
 # fails with the gateway's own error.
 use_relay() {
   mkdir -p "$HOME_DIR/.config/opencode" 2>/dev/null || true
+  # The model the harness wants: one pin file, read live by BOTH sides.
+  # "sajilo model <name>" writes it, this puts it in the runtime config, and
+  # the relay honours the same file on every request - so changing the model
+  # in the harness changes what the relay sends upstream, with no restart.
+  local model_json=""
+  if [ -n "$MODEL_ID" ]; then
+    model_json=",\"model\":\"opencode/$MODEL_ID\""
+  fi
   cat >"$HOME_DIR/.config/opencode/opencode.json" <<EOF
 {
-  "\$schema": "https://opencode.ai/config.json",
+  "\$schema": "https://opencode.ai/config.json"$model_json,
   "provider": {
     "opencode": {
       "options": {
@@ -140,6 +157,32 @@ use_direct() {
   rm -f "$HOME_DIR/.config/opencode/opencode.json" 2>/dev/null || true
 }
 
+# sajilo model            -> show the current choice
+# sajilo model <name>     -> pin the model (runtime AND relay follow it)
+# sajilo model --auto     -> back to the free pool
+model_cmd() {
+  case "${1:-}" in
+    "")
+      if [ -n "$MODEL_ID" ]; then
+        echo "model        : $MODEL_ID"
+      else
+        echo "model        : auto (the relay rotates the free pool)"
+      fi
+      ;;
+    --auto)
+      rm -f "$MODEL_FILE" 2>/dev/null || true
+      echo "model        : auto (the relay rotates the free pool)"
+      ;;
+    *)
+      mkdir -p "$STATE" 2>/dev/null || true
+      printf '%s\n' "$1" >"$MODEL_FILE"
+      echo "model pinned : $1"
+      echo "              (the relay uses it on the next request; the free pool"
+      echo "               still covers it if that model is drained)"
+      ;;
+  esac
+}
+
 status() {
   echo "root        : $ROOT"
   echo "relay       : $(curl -s -m 5 "http://127.0.0.1:$RELAY_PORT/relay-health" 2>/dev/null || echo DOWN)"
@@ -147,12 +190,21 @@ status() {
   echo "db          : $HOME_DIR/.local/share/opencode/opencode.db"
   echo "project     : $WORK"
   echo "runtime     : $OPENCODE_BIN"
+  if [ -n "$MODEL_ID" ]; then
+    echo "model       : $MODEL_ID"
+  else
+    echo "model       : auto (the relay rotates the free pool)"
+  fi
   echo "usque       : $(have_usque && echo available || echo 'not installed - native egress only')"
   echo "live relay  : $(curl -s -m 5 http://127.0.0.1:43904/relay-health 2>/dev/null || echo 'not running')"
 }
 
 case "${1:-tui}" in
   status) status ;;
+  model)
+    shift
+    model_cmd "${1:-}"
+    ;;
   shell)
     use_relay
     use_tunnel || use_native

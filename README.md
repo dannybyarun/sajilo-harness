@@ -102,6 +102,36 @@ Two rules in the prompt are worth knowing about:
   harness spec itself stays English - the gateway's whitelist is matched on
   the shape of the request, not on its prose.
 
+## Choosing the model
+
+One place, one file, both sides.
+
+```bash
+sajilo model                  # what is it right now?
+sajilo model glm-5.3-flash-free   # pin it
+sajilo model --auto           # back to the free pool
+```
+
+`sajilo model <name>` writes a single pin file (`<root>/state/model.txt`).
+**Both** sides read it, live:
+
+- the launcher puts it in the runtime config, so the harness shows and uses
+  that model,
+- the relay re-reads it on **every request**, so the model that goes upstream
+  changes immediately - no restart, no second file to edit.
+
+The pin is a preference, not a straitjacket: if the pinned model is drained,
+the relay still falls back to the free pool and keeps the request alive. With
+no pin, the relay rotates the pool on its own.
+
+The harness prompt's `Your Model` block is filled in with the model that
+actually served the request, so the agent knows what it is:
+
+```
+> in one line: your name and the exact model id you are running as?
+Sajilo, running as `sajilo/glm-5.3-flash-free`.
+```
+
 ## Platform matrix
 
 | | Linux / macOS / WSL | Windows |

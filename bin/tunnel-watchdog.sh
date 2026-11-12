@@ -23,7 +23,7 @@
 # available for manual runs: bash tunnel-watchdog.sh).
 set -u
 
-STATE=/root/ocm
+STATE=${SAJILO_STATE:-${SAJILO_ROOT:-/root/ocm}/state}
 LOG="$STATE/watchdog.log"
 LAST="$STATE/.watchdog.last"
 # resolve_proxy_port — which port does the running opencode server use for its

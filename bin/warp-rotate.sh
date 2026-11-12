@@ -25,7 +25,7 @@
 set -u
 
 CONF=/root/.config/usque/config.json
-STATE=/root/ocm
+STATE=${SAJILO_STATE:-${SAJILO_ROOT:-/root/ocm}/state}
 LOG="$STATE/usque.log"
 LOCK="$STATE/.rotate.lock"
 # The proxy port MUST match what the opencode server process has in

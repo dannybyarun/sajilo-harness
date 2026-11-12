@@ -179,6 +179,15 @@ function toolName(t: unknown): string | undefined {
   return typeof n === "string" ? n : undefined
 }
 
+/**
+ * The caller's own prompt carries its own "# Your Model" block. The harness
+ * owns the identity, so the duplicate is dropped: with two different model
+ * identities in one request the model picks the wrong one.
+ */
+function stripModelBlock(text: string): string {
+  return text.replace(/\r?\n# Your Model\r?\n(?:- .*\r?\n?)*/g, "\n")
+}
+
 function transformBody(raw: string): string {
   let parsed: Record<string, unknown>
   try {
@@ -194,7 +203,7 @@ function transformBody(raw: string): string {
     if (role === "system" || role === "developer") {
       const c = (m as { content?: unknown }).content
       const text = typeof c === "string" ? c : JSON.stringify(c)
-      if (text) systems.push(text)
+      if (text) systems.push(stripModelBlock(text))
     } else {
       rest.push(m)
     }
@@ -285,6 +294,22 @@ function setModel(body: string, model: string): string {
 }
 
 /**
+ * The model the harness asked for. Written by "sajilo model <name>" and read
+ * here on EVERY request, so the pin is live: change the model in the harness
+ * and the next request upstream uses it, with no restart anywhere.
+ */
+function modelPin(): string | null {
+  try {
+    const f = env("RELAY_MODEL_FILE") ?? "/tmp/sajilo/relay-model-override.txt"
+    const m = readFileSync(f, "utf8").trim()
+    if (m) return m
+  } catch {
+    /* no pin file — the runtime's own choice is used */
+  }
+  return null
+}
+
+/**
  * Fill the harness prompt's "Your Model" block with the model that is
  * actually serving the request. The free pool rotates, so the prompt must
  * not claim a fixed model - the agent has to know what it really is.
@@ -300,7 +325,7 @@ function applyModelIdentity(body: string, model: string): string {
   if (!body.includes("{{MODEL_ID}}")) return body
   try {
     const b = JSON.parse(body) as {
-      messages?: Array<{ role?: string; content?: unknown }>
+      messages?: Array<{ role?: string; content?: string }>
     }
     const msgs = Array.isArray(b.messages) ? b.messages : []
     for (const m of msgs) {
@@ -311,7 +336,7 @@ function applyModelIdentity(body: string, model: string): string {
         .split("{{MODEL_ID}}")
         .join(model)
         .split("{{PROVIDER_ID}}")
-        .join("sajilo-relay")
+        .join("sajilo")
     }
     return JSON.stringify(b)
   } catch {
@@ -436,7 +461,7 @@ function kickRescue(reason: string): boolean {
 // immediately after the call), so the opencode server's own provider calls
 // are not parked on the native egress.
 const DIRECT_EGRESS_FLAG =
-  env("RELAY_DIR")ECT_EGRESS_FLAG ?? "/tmp/sajilo/relay-direct-egress.txt"
+  env("RELAY_DIRECT_EGRESS_FLAG") ?? "/tmp/sajilo/relay-direct-egress.txt"
 
 function directEgressEnabled(): boolean {
   try {
@@ -932,6 +957,19 @@ function startServer(): void {
             if (typeof m === "string" && m) originModel = m
           } catch {
             /* not JSON — keep the default model */
+          }
+          // The harness owns the model choice. "sajilo model <name>" writes a
+          // pin file that the launcher also reads (it puts the model in the
+          // runtime config), and this relay honours it on every request - so
+          // changing the model in the harness changes what the relay sends
+          // upstream, with no restart. The pin is only a PREFERENCE: if the
+          // pinned model is drained the relay still falls back to the pool.
+          const pinned = modelPin()
+          if (pinned) {
+            originModel = pinned
+            logActivity(
+              `[${new Date().toISOString()}] MODEL-PINNED ${pinned} (harness choice; pool rotation still available as fallback)`,
+            )
           }
           // A UI can offer a model picker whose choice never reaches the
           // request body (Freebuff's `/model` writes settings.freebuffModel,
