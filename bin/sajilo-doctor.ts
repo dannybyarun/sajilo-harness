@@ -173,11 +173,24 @@ try {
   // The rule: the caller always gets the model it asked for. A request
   // answered by a different model means the relay rotated - which it must
   // not do any more, because a rotation changes the answer, not the quota.
-  const rotations = last.filter((l) => l.includes("SPIN fallback used")).length
+  //
+  // Judge only what the CURRENT build did: the log also holds the history of
+  // earlier builds, and an old rotation must not fail today's check. The
+  // relay writes a RELAY-START marker when it comes up.
+  const lastStart = lines.reduce(
+    (acc, l, i) => (l.includes("RELAY-START") ? i : acc),
+    -1,
+  )
+  const since = lastStart >= 0 ? lines.slice(lastStart) : last
+  const build = /RELAY-START build=(\S+)/.exec(lines[lastStart] ?? "")?.[1]
+  const rotations = since.filter((l) => l.includes("SPIN fallback used")).length
   if (rotations) {
     bad(`${rotations} request(s) were answered by a model the caller did not ask for - the relay must reset the limit, never rotate models`)
   } else {
-    ok("every request was answered by the model it asked for")
+    ok(
+      `every request was answered by the model it asked for` +
+        `${build ? ` (build ${build})` : ""}`,
+    )
   }
 } catch (e) {
   warn(`no reset record yet: ${e}`)

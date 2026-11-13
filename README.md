@@ -27,13 +27,17 @@ everything the relay knows how to do:
 
 - the **gateway whitelist** (the relay rewrites the body into the approved
   "agent class" - the free models only accept that shape),
-- the free-model **pool rotation** (ten free models, the relay rotates when
-  one is drained),
+- the **limit reset** (a 429 means this identity's window is empty, so the
+  relay gets a fresh identity - a new egress and a new session/project pair
+  - and retries **the same model**; it never rotates to a different one),
+- the **refill wait** (the gateway says when the window refills, so a short
+  wait is cheaper than a reset),
 - the **egress ladder** (proxied path first, then the device's native
   egress - a dead proxy no longer kills the request),
-- the **spin budget** (a request is never parked for minutes),
-- the **rescue chain** (rotate the egress and refresh the credential in the
-  background).
+- the **keep-working ceiling** (a request is never abandoned - the relay works
+  for up to 4 minutes, then answers a retryable 503),
+- the **no-quota-error rule** (a 429 is never passed on: the caller gets the
+  model it asked for, or a retryable 503 - never "Free usage limit reached").
 
 ## Install
 
@@ -119,7 +123,8 @@ Two rules in the prompt are worth knowing about:
 
 - **It knows what it is.** The `Your Model` block is filled in with the model
   that actually served the request, so the agent never claims to be a model it
-  is not. The free pool rotates underneath it.
+  is not. And it is always the model that was asked for - the relay resets
+  the limit instead of rotating models.
 - **It answers in your language.** Write in Nepali, get Nepili back. The
   harness spec itself stays English - the gateway's whitelist is matched on
   the shape of the request, not on its prose.
@@ -145,9 +150,9 @@ sajilo model --auto           # back to the free pool
 The default is **DeepSeek V4.1 Flash Free** - the harness starts on it and the
 relay leads with it, so the two always agree.
 
-The pin is a preference, not a straitjacket: if the pinned model is drained,
-the relay still falls back to the free pool and keeps the request alive. With
-no pin, the relay rotates the pool on its own.
+The pin is a preference, not a straitjacket: if the pinned model's window is
+empty, the relay **resets the limit** (a fresh identity) and keeps serving
+that same model - it never answers with a different one.
 
 ### Switching the model in the TUI just works
 
@@ -214,8 +219,9 @@ back.
 
 The relay is a plain **OpenAI-compatible endpoint**. Any client that speaks
 OpenAI can use Sajilo as a custom provider - and it gets the whole relay
-behaviour: the gateway whitelist, the free-model pool rotation, the egress
-ladder, the spin budget, the rescue chain.
+behaviour: the gateway whitelist, the limit reset, the egress ladder, the
+keep-working ceiling, and the rule that a rate-limit error never reaches the
+caller.
 
 ```bash
 sajilo relay      # start the provider on its own (headless)
@@ -291,9 +297,27 @@ Which one to use:
 The gateway's free allowance is a rolling window, and it is **weighted by the
 request**: a small request fits when a big one does not. A third-party agent
 with a full toolset (19 tool schemas, tens of KB of prompt) can exhaust the
-window that a one-tool agent uses comfortably. When it is empty, the relay
-tries all eleven free models and answers with the real 429 - the caller sees
-the gateway's own error, in the gateway's own words.
+window that a one-tool agent uses comfortably.
+
+When the window is empty, the relay does **not** give up and does **not** swap
+models. It keeps working:
+
+1. the 429 carries a `Retry-After`, so the relay knows exactly when the
+   window refills - a short wait is cheaper than anything else,
+2. otherwise it **resets the identity**: a new egress IP and a new
+   session/project pair, which is a fresh bucket (measured: 14-22 s, and the
+   requested model serves again immediately),
+3. and it retries **the same model** every time - as many times as it takes.
+
+The relay keeps going for as long as the client stays connected (4 minutes by
+default - the ceiling Bun's idle timeout allows). If the network itself dies, the egress is repaired in the
+background and the request is retried - it is never abandoned.
+
+The caller never sees a rate-limit error. If the client is still there when
+the ceiling is reached, the relay answers **503** with the gateway's own
+`Retry-After` - a retryable status that is not a quota error - and the reset
+keeps running in the background, so the next attempt lands on a fresh
+identity.
 
 ### From another machine
 
@@ -398,8 +422,9 @@ on it:
 
 - the **first line** is replaced by Sajilo's identity,
 - the **model block** is Sajilo's template, filled in per request with the
-  model that actually served it (the relay rotates models under the hood, and
-  the agent reports the truth - `Sajilo, nemotron-3.5-lightning-free`),
+  model that actually served it (always the model that was asked for - the
+  relay resets the limit instead of rotating models, and the agent reports
+  the truth - `Sajilo, deepseek-v4.1-flash-free`),
 - a **`# Sajilo` section** carries Sajilo's own rules.
 
 Everything else - the sections, the tool catalog, the MCP tools - is whatever
@@ -453,32 +478,34 @@ Everything the relay decides, in `<root>/state/`:
 
 | file | what it holds |
 |---|---|
-| `relay-activity.log` | every decision: the model each request chose, every upstream status, every 429, every ladder move, every rescue, every harness capture, every config merge |
+| `relay-activity.log` | every decision: the model each request chose, every upstream status, every 429 and when it refills, every ladder move, every reset, every harness capture, every config merge |
 | `relay-last-incoming.json` | the last request body exactly as the client sent it |
 | `relay-last-transformed.json` | the same body after the relay rewrote it into the agent class |
 | `relay-last-meta.txt` | pathname, model, and the size of both |
-| `rescue.log` | the rescue chain's transcript: what it rotated, what it minted |
+| `rescue.log` | the reset transcript: what it rotated, what it minted |
 
 `sajilo doctor` reads them back and gives the summary:
 
 ```
-rotation record
-  ok    17 upstream 200s, 225 model 429s, 0 ladder climbs, 4 rescues (last 400 log lines)
-  warn  models hitting 429 most: deepseek-v4.1-flash-free:31, mimo-v2.6-flash-free:29
-  ok    last success: 2026-11-12T18:24:00
+reset record
+  ok    52 upstream 200s, 57 model 429s, 79 ladder climbs, 0/0 resets landed (last 400 log lines)
+  warn  models hitting 429 most: deepseek-v4.1-flash-free:9, mimo-v2.6-flash-free:7
+  ok    last success: 2026-11-13T04:55:03
+  ok    every request was answered by the model it asked for
 ```
 
 That is usually the fastest way to answer "is it Sajilo or the quota?": if
 the models are 429ing one after another it is the allowance; if the harness
-probe fails while the models are fine it is the harness.
+probe fails while the models are fine it is the harness. The last line is the
+canary: if it ever fails, something rotated a model again.
 
 ## Platform matrix
 
 | | Linux / macOS / WSL | Windows |
 |---|---|---|
 | separate HOME, DB, sessions, project | yes | yes |
-| own relay (port 43914) with pool/ladder/budget/rescue | yes | yes |
-| own **rotatable** WARP tunnel (usque) | yes (if `usque` is present) | no - native egress |
+| own relay (port 43914) with ladder/budget/reset | yes | yes |
+| own **rotatable** WARP tunnel (usque) | yes (if `usque` is present) | yes (the opencode-warp stack) |
 | egress recovery by rotating the IP | yes | native egress only (a second bucket can be added by pointing `SAJILO_RELAY_PROXY` at any local HTTP proxy) |
 | the live opencode is unaffected | yes | yes |
 
@@ -503,7 +530,7 @@ SAJILO_TUNNEL_PORT=8080 SAJILO_RELAY_PROXY=http://127.0.0.1:8080 sajilo
 ```
 
 Everything is per-instance: the relay port, the proxy, the pins, the mint
-directory, the rescue log and the rotator path. Two instances never share a
+directory, the reset log and the rotator path. Two instances never share a
 file.
 
 ## Runtime knobs (all optional)
@@ -516,9 +543,13 @@ file.
 | `SAJILO_BIN` | the runtime binary to use (default: the pinned opencode) |
 | `SAJILO_NO_DOWNLOAD` | `1` = never download a runtime, fail instead |
 | `SAJILO_FORCE_DOWNLOAD` | `1` = ignore the installed runtime, fetch a private one into the instance |
-| `SAJILO_RELAY_SPIN_BUDGET_MS` | how long a request may spin before the relay answers with the last error (default 45000) |
+| `SAJILO_RELAY_KEEP_WORKING_MS` | how long the relay keeps working on one request - waiting out refills, resetting the identity, rotating the egress - before it answers a retryable 503 (default 240000; Bun's idle cap is 255 s, so a longer hold would have its socket cut) |
+| `SAJILO_RELAY_MAX_RESETS` | a safety valve on the resets per request; `0` = unlimited, the ceiling above is the only limit (default 0) |
+| `SAJILO_RELAY_WAIT_MAX_SECONDS` | the longest refill the relay waits out instead of resetting the identity (default 45) |
+| `SAJILO_RELAY_LONG_WAIT_MAX_SECONDS` | the longest single wait the relay will hold a request for, once a reset has failed to bring the window back (default 600) |
+| `SAJILO_RELAY_RESET_COOLDOWN_MS` | how long the relay waits before starting a NEW reset (a storm of 429s shares one reset) (default 20000) |
 | `SAJILO_RELAY_AUTOMINT=0` | disable the automatic identity rotation |
-| `SAJILO_RELAY_EGRESS_ROTATE=0` | the rescue chain refreshes the credential but does not touch the egress |
+| `SAJILO_RELAY_EGRESS_ROTATE=0` | the reset refreshes the credential but does not touch the egress |
 | `OPENCODE_BIN` | legacy alias for `SAJILO_BIN` |
 
 The `OPENCODE_RELAY_*` names still work everywhere a `SAJILO_RELAY_*` name is
@@ -531,8 +562,12 @@ Live-reloadable files (no restart needed):
 | `<root>/state/direct-egress` | the relay bypasses its proxy and uses the native egress |
 | `<root>/state/relay-upstream.txt` | point the relay at a different upstream |
 | `<root>/state/sajilo-bin.txt` | the exact runtime binary Sajilo starts |
-| `<root>/state/rescue.log` | the rescue chain's transcript |
+| `<root>/state/rescue.log` | the reset transcript |
 | `<root>/state/relay-activity.log` | the relay's activity log |
+
+`sajilo mint` resets the limit on demand: it mints a fresh session/project
+pair (skipping the mint cooldown), which is a fresh quota bucket for every
+model.
 
 ## What the runtime is allowed to do
 
@@ -547,6 +582,27 @@ OPENAI_BASE_URL=http://127.0.0.1:43914/v1 OPENAI_API_KEY=public my-tool
 ```
 
 ## How it was verified
+
+On this instance (Windows, WARP tunnel, the live gateway):
+
+- the reset path, end to end: a 429 with `Retry-After: 7` -> the relay waits
+  7.1 s -> retries **the same model** -> the caller gets `200` and the model
+  it asked for. The mock upstream saw `deepseek-v4.1-flash-free` on every
+  single attempt.
+- the keep-working path: three consecutive 429s -> the relay waited each
+  one out and served the fourth attempt (200 after 21.1 s, same model); and
+  an upstream that 429s *forever* -> the relay made 11 attempts in 90 s,
+  all of them for the same model, and was still working when the client's
+  own timeout fired.
+- the give-up path: a gateway that 429s every time -> the caller gets
+  `503` + `retry-after`, never a 429 and never "Free usage limit reached".
+- the reset itself: a fresh pair is minted in 14-22 s, and the requested
+  model serves again immediately (18/20, 77/81 and 12/12 of the requests in
+  the 90 s after a reset were served by the requested model).
+- the old pool rotation, for comparison: it answered 15% of all requests with
+  a model nobody had asked for, and burned 2162 failed upstream calls -
+  each one re-uploading the whole (up to 680 KB) body against an allowance
+  that is weight-based.
 
 On an Android device (opencode.mobile + proot), against the live instance:
 separate DB and sessions, separate tunnel identity, separate exit IP, a lab

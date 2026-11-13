@@ -82,6 +82,10 @@ function define<T>(plugin: T): T {
 type Ctx = { options?: Record<string, unknown>; [k: string]: unknown }
 
 const PORT = Number(env("RELAY_PORT") ?? 43904)
+// A build marker. The doctor reads it to tell which relay wrote the log, and
+// judges only what THIS build did - the log also holds the history of
+// earlier builds, and an old rotation must not fail today's check.
+const BUILD = "reset-429-2026-11-13"
 // Where the relay listens. 127.0.0.1 keeps it on this machine (other local
 // agents can still use it). Set it to 0.0.0.0 to serve other machines - but
 // then a token is REQUIRED, because the relay spends the account's quota.
@@ -772,15 +776,13 @@ function startReset(reason: string): Promise<ResetResult> {
   // Share the reset that is already running: a storm of 429s must not spawn
   // one opencode run each.
   if (resetInFlight) return resetInFlight
-  if (Date.now() - lastResetAt < RESET_COOLDOWN_MS) {
-    // A reset landed just now, so the identity is already fresh - but the
-    // window may still be empty. Say so instead of spawning another
-    // opencode run.
-    return Promise.resolve({
-      ok: false,
-      session: sessionID(),
-      note: "a reset landed just now - the identity is fresh, the window may not be",
-    })
+  const cooldownLeft = RESET_COOLDOWN_MS - (Date.now() - lastResetAt)
+  if (cooldownLeft > 0) {
+    // A reset landed a moment ago and the window is still empty, so the
+    // cooldown must NOT become a give-up: wait it out and then really reset.
+    // Handing the caller an error here is exactly what we promised not to
+    // do.
+    return Bun.sleep(cooldownLeft).then(() => startReset(reason))
   }
   lastResetAt = Date.now()
   const p = performReset(reason)
@@ -1242,7 +1244,21 @@ function startServer(): void {
       server = Bun.serve({
         port: PORT,
         hostname: BIND,
-        idleTimeout: 240,
+        // Bun.serve REQUIRES idleTimeout <= 255 - a bigger value throws
+        // "Bun.serve expects idleTimeout to be 255 or less", and that throw
+        // used to fail the whole plugin load (the relay went down with it).
+        // The cap is Bun's, so the keep-working ceiling is clamped to fit
+        // under it: the relay always answers before the socket can be cut.
+        idleTimeout: Math.min(
+          255,
+          Math.max(
+            60,
+            Math.ceil(
+              Number(env("RELAY_KEEP_WORKING_MS") ?? env("RELAY_SPIN_BUDGET_MS") ?? 240_000) /
+                1000,
+            ),
+          ),
+        ),
         maxRequestBodySize: 64 * 1024 * 1024,
       async fetch(req: Request) {
         try {
@@ -1491,34 +1507,47 @@ function startServer(): void {
           // client is still there after the ceiling. In practice the reset
           // recovers the window in 14-22 s, so the answer is a slow one, not
           // an error.
-          const SPIN_BUDGET_MS = Number(env("RELAY_SPIN_BUDGET_MS") ?? 150_000)
+          //
+          // The ceiling sits under Bun's 255 s idle cap: a request that is
+          // held longer than that would have its socket cut, which the
+          // caller would read as a network error. The client usually gives
+          // out first anyway, and its retry lands on the fresh identity.
+          const KEEP_WORKING_MS = Number(
+            env("RELAY_KEEP_WORKING_MS") ?? env("RELAY_SPIN_BUDGET_MS") ?? 240_000,
+          )
           // A safety valve, not a policy: 0 = unlimited (the ceiling above is
           // the only limit). Each reset spawns a real opencode run and
           // rotates the tunnel, so this only exists to stop a pathological
           // loop.
-          const MAX_RESETS = Number(env("RELAY_MAX_RESETS") ?? 4)
+          const MAX_RESETS = Number(env("RELAY_MAX_RESETS") ?? 0)
           // The longest refill the relay is willing to WAIT for instead of
           // resetting the identity. Past that, waiting beats resetting (the
           // window is a rolling one), and the gateway's Retry-After goes
           // to the caller so its retry is timed right.
           const WAIT_MAX_SECONDS = Number(env("RELAY_WAIT_MAX_SECONDS") ?? 45)
+          // The longest single wait we will hold a request for. The gateway's
+          // own refill time is the ground truth - if the window comes back in
+          // ten minutes, waiting IS the working answer.
+          const LONG_WAIT_MAX_SECONDS = Number(
+            env("RELAY_LONG_WAIT_MAX_SECONDS") ?? 600,
+          )
           const spinStarted = Date.now()
           let fetchErrors = 0
           let resets = 0
           outer: while (true) {
-            if (Date.now() - spinStarted > SPIN_BUDGET_MS) {
+            if (Date.now() - spinStarted > KEEP_WORKING_MS) {
               // A reset that is still landing would give this request a fresh
               // identity to retry against, so give it a bounded moment - but
               // not an open-ended wait.
-              if (resetInFlight && Date.now() - spinStarted < SPIN_BUDGET_MS + 30_000) {
+              if (resetInFlight && Date.now() - spinStarted < KEEP_WORKING_MS + 30_000) {
                 logActivity(
-                  `[${new Date().toISOString()}] SPIN budget exhausted while a reset is in flight - waiting for it`,
+                  `[${new Date().toISOString()}] SPIN ceiling reached while a reset is in flight - waiting for it`,
                 )
                 await Bun.sleep(5_000)
                 continue
               }
               logActivity(
-                `[${new Date().toISOString()}] SPIN budget exhausted (${SPIN_BUDGET_MS}ms) after ${resets} reset(s) - answering with a retryable 503`,
+                `[${new Date().toISOString()}] SPIN ceiling reached (${KEEP_WORKING_MS}ms) after ${resets} reset(s) - answering with a retryable 503`,
               )
               break outer
             }
@@ -1582,13 +1611,16 @@ function startServer(): void {
                   `[${new Date().toISOString()}] SPIN fetch-error on every egress (${wanted}): ${finalErrBody}`,
                 )
                 if (fetchErrors >= 3) {
-                  // Every egress is unreachable. The reset repairs the egress
-                  // in the background; the client retries.
+                  // Every egress is unreachable. Do NOT give up: the tunnel is
+                  // most likely mid-rotation, and the reset repairs it. The
+                  // caller waits a little longer and the answer still comes.
                   logActivity(
-                    `[${new Date().toISOString()}] SPIN aborting: every egress unreachable after ${fetchErrors} fetch errors`,
+                    `[${new Date().toISOString()}] SPIN every egress unreachable (${fetchErrors} fetch errors) - repairing the egress and trying again`,
                   )
+                  fetchErrors = 0
                   void startReset("egress-unreachable")
-                  break outer
+                  await Bun.sleep(5_000)
+                  continue outer
                 }
               }
             }
@@ -1629,7 +1661,7 @@ function startServer(): void {
                 )
                 break outer
               }
-              const remaining = SPIN_BUDGET_MS - (Date.now() - spinStarted)
+              const remaining = KEEP_WORKING_MS - (Date.now() - spinStarted)
               if (remaining <= 0) break outer
               // The gateway told us when the window refills. If that is soon
               // enough to fit in what is left of the ceiling, waiting it out
@@ -1643,7 +1675,12 @@ function startServer(): void {
               const waitMs = refillIn * 1000
               const fits = refillIn > 0 && waitMs <= remaining
               const shortWait = fits && refillIn <= WAIT_MAX_SECONDS
-              if (shortWait) {
+              const longWait =
+                fits &&
+                refillIn > WAIT_MAX_SECONDS &&
+                refillIn <= LONG_WAIT_MAX_SECONDS &&
+                resets > 0
+              if (shortWait || longWait) {
                 logActivity(
                   `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window refills in ${refillIn}s - waiting it out (no reset)`,
                 )
@@ -1653,7 +1690,7 @@ function startServer(): void {
               // The window for THIS identity is empty. Reset it - a new egress
               // and a new session/project pair - and retry the SAME model
               // against the fresh identity.
-              if (resets >= MAX_RESETS) {
+              if (MAX_RESETS > 0 && resets >= MAX_RESETS) {
                 logActivity(
                   `[${new Date().toISOString()}] SPIN 429 on ${wanted} after ${resets} resets - giving up on this request`,
                 )
@@ -1661,7 +1698,7 @@ function startServer(): void {
               }
               resets++
               logActivity(
-                `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window for this identity is empty - resetting the limit (reset ${resets}/${MAX_RESETS})` +
+                `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window for this identity is empty - resetting the limit (reset ${resets}${MAX_RESETS > 0 ? `/${MAX_RESETS}` : ""})` +
                   `${refillIn > 0 ? ` (the gateway says this window refills in ${refillIn}s)` : ""}`,
               )
               // Wait for the reset, but never past the ceiling: a reset that
@@ -1675,7 +1712,7 @@ function startServer(): void {
               ])
               if (raced.timedOut) {
                 logActivity(
-                  `[${new Date().toISOString()}] SPIN budget exhausted while the reset was landing - answering with a retryable 503`,
+                  `[${new Date().toISOString()}] SPIN ceiling reached while the reset was landing - answering with a retryable 503`,
                 )
                 break outer
               }
@@ -1685,9 +1722,9 @@ function startServer(): void {
                 // window - the next attempt still costs the caller nothing
                 // but time.
                 logActivity(
-                  `[${new Date().toISOString()}] RESET did not land (${raced.reset?.note ?? "unknown"}) - waiting 3s and retrying ${wanted}`,
+                  `[${new Date().toISOString()}] RESET did not land (${raced.reset?.note ?? "unknown"}) - waiting 10s and retrying ${wanted}`,
                 )
-                await Bun.sleep(3_000)
+                await Bun.sleep(Math.min(10_000, Math.max(0, remaining)))
               }
               continue
             }
@@ -1695,7 +1732,7 @@ function startServer(): void {
               // 5xx / 402: a transient server-side problem. Back off a moment
               // and retry the SAME model - the model is not the problem, and
               // the caller's request shape is unchanged.
-              const remaining = SPIN_BUDGET_MS - (Date.now() - spinStarted)
+              const remaining = KEEP_WORKING_MS - (Date.now() - spinStarted)
               if (remaining <= 0) break outer
               await Bun.sleep(Math.min(2_000, remaining))
               continue
@@ -2006,6 +2043,11 @@ function readModelPin(): string {
 
 export async function startRelay(): Promise<void> {
   {
+    // Every instance writes this, whether it binds or adopts the port: the
+    // doctor uses the last marker as the start of the window it judges.
+    logActivity(
+      `[${new Date().toISOString()}] RELAY-START build=${BUILD} pid=${process.pid}`,
+    )
     if (env("RELAY_ENABLED", "BUN_RELAY") === "0") return
     if (server) return
 
@@ -2089,10 +2131,27 @@ export async function startRelay(): Promise<void> {
         startWatchdog()
         return
       }
-      throw e
+      // Any other failure (a bad option, a permission problem) used to be
+      // rethrown, and the throw escaped the plugin: opencode logged
+      // "failed to load plugin" and DEACTIVATED it - so one bad relay option
+      // took the whole agent down, not just the provider. The relay is a
+      // convenience; it must never be able to break the runtime that loads
+      // it. Say it loudly and keep the agent alive.
+      process.stderr.write(
+        `[sajilo-relay] could not start the relay on port ${PORT}: ${msg}\n` +
+          `[sajilo-relay] degrading - the runtime keeps working, but there is no local relay\n`,
+      )
+      logActivity(
+        `[${new Date().toISOString()}] START failed to bind port ${PORT}: ${msg.slice(0, 300)}`,
+      )
+      startWatchdog()
+      return
     }
     await Bun.sleep(50)
     process.stderr.write(`[sajilo-relay] listening on http://127.0.0.1:${PORT}\n`)
+    logActivity(
+      `[${new Date().toISOString()}] RELAY-LISTENING build=${BUILD} port=${PORT}`,
+    )
     startWatchdog()
 
 // Proactive tunnel watchdog: probe the WARP egress every few minutes and
