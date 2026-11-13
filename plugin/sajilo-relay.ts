@@ -1770,7 +1770,10 @@ function startServer(): void {
         // Seconds until the window refills, as the gateway said. The error
         // path hands it to the caller as its Retry-After, so a retry lands
         // exactly when the quota is back.
-        let lastRefillIn = 0
+        // When the next model frees up. The EARLIEST refill seen in this
+        // request: that is the moment the caller can be served again. The
+        // last model's clock is the wrong answer - it is the latest one.
+        let nextRefillIn = 0
         let finalStatus = 0
         let finalErrBody = "<no response>"
         if (isChat) {
@@ -1874,6 +1877,10 @@ function startServer(): void {
           // Did the identity mint land? Once it has, a further 429 means the
           // model is empty for the whole account - not for this identity.
           let mintSettled = false
+          // Did the mint really hand back a NEW identity? A mint that returns
+          // the same one is not a reset: the quota bucket did not change, so
+          // the window that comes back is the old window.
+          let mintChanged = false
           outer: while (true) {
             if (Date.now() - spinStarted > KEEP_WORKING_MS) {
               // A reset that is still landing would give this request a fresh
@@ -1967,11 +1974,13 @@ function startServer(): void {
             if (resp.status === 200) {
               upstream = resp
               servedModel = wanted
-              // Say plainly which model answered. The relay does NOT rotate
-              // models: a drained window is fixed with a fresh identity, so
-              // this is always the model the caller asked for.
+              // Say plainly WHICH model answered - and, when it is not the one
+              // the caller asked for, say that too. A log that claims "as
+              // requested" for a substituted model hides exactly the thing
+              // the user needs to see.
+              const how = wanted === originModel ? "as requested" : `rotated from ${originModel}`
               logActivity(
-                `[${new Date().toISOString()}] SERVED ${wanted} (as requested)`,
+                `[${new Date().toISOString()}] SERVED ${wanted} (${how})`,
               )
               break outer
             }
@@ -1984,7 +1993,13 @@ function startServer(): void {
             // fresh identity instead.
             const retryAfter = resp.headers.get("retry-after")
             const refillIn = retryAfterSeconds(retryAfter)
-            if (refillIn > 0) lastRefillIn = refillIn
+            if (refillIn > 0) {
+              // Keep the EARLIEST refill, not the last one. The caller is told
+              // when to come back, and what matters is when the NEXT model
+              // frees up - not the last model we happened to try. Taking the
+              // last one made the caller wait many times longer than it needed.
+              if (nextRefillIn === 0 || refillIn < nextRefillIn) nextRefillIn = refillIn
+            }
             logActivity(
               `[${new Date().toISOString()}] SPIN ${resp.status} on ${wanted}: ${errBody.slice(0, 200)}` +
                 `${refillIn > 0 ? ` (the window refills in ${refillIn}s)` : ""}`,
@@ -2048,8 +2063,9 @@ function startServer(): void {
                   continue
                 }
                 logActivity(
-                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: a fresh egress and a fresh identity did not help - the model is empty for the whole account` +
-                    `${refillIn > 0 ? ` (it refills in ${refillIn}s)` : ""}. Answering with that time instead of spinning.`,
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: ` +
+                    `${mintChanged ? "a fresh egress and a fresh identity did not help - the model is empty for the whole account" : "the reset did not change the identity, so the same window came back"}` +
+                    `${refillIn > 0 ? ` (the next model frees up in ${refillIn}s)` : ""}. Answering with that time instead of spinning.`,
                 )
                 break outer
               }
@@ -2102,11 +2118,18 @@ function startServer(): void {
                 })
                 mintPending = mintIdentity(`429-${wanted}`)
                 mintPending.then(
-                  () => {
+                  (r) => {
                     mintSettled = true
+                    mintChanged = r.ok
+                    if (!r.ok) {
+                      logActivity(
+                        `[${new Date().toISOString()}] RESET did not change the identity - the window that came back is the same one`,
+                      )
+                    }
                   },
                   () => {
                     mintSettled = true
+                    mintChanged = false
                   },
                 )
                 continue
@@ -2229,7 +2252,7 @@ function startServer(): void {
               // done and it still does not work, the window really is empty
               // and the gateway's own time is the right answer.
               const resetPending = resetInFlight !== null
-              const refill = lastRefillIn > 0 ? Math.min(lastRefillIn, 3600) : 5
+              const refill = nextRefillIn > 0 ? Math.min(nextRefillIn, 3600) : 5
               const retryIn = resetPending ? Math.min(refill, 30) : refill
               headers.set("retry-after", String(retryIn))
               if (requestedModel) headers.set("x-sajilo-model", requestedModel)
