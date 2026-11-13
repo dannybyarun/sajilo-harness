@@ -110,6 +110,13 @@ if "%SAJILO_RELAY_PROXY%"=="" (
   netstat -ano | findstr /R /C:"127.0.0.1:40000 .*LISTENING" >nul 2>&1
   if not errorlevel 1 set "SAJILO_RELAY_PROXY=http://127.0.0.1:40000"
 )
+REM The SECOND leg of the egress ladder: the device's OWN exit, not the
+REM tunnel's. The shim (egress-proxy.py --upstream direct) connects with a
+REM raw socket, so it leaves the tunnel - and a different exit IP is a
+REM different quota bucket, which is what the ladder climbs to. Bun < 1.4
+REM ignores NO_PROXY, so this is the only way out of the tunnel on Windows.
+REM The relay starts the shim itself if it is not running yet.
+if "%SAJILO_RELAY_DIRECT_PROXY%"=="" set "SAJILO_RELAY_DIRECT_PROXY=http://127.0.0.1:40001"
 set "OPENCODE_RELAY_PROXY="
 set "NO_PROXY=127.0.0.1,localhost,::1"
 set "no_proxy=127.0.0.1,localhost,::1"

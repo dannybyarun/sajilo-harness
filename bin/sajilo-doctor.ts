@@ -134,12 +134,33 @@ const ambientProxy =
   process.env.http_proxy ??
   ""
 const proxy = explicitProxy || ambientProxy
+const directProxy =
+  process.env.SAJILO_RELAY_DIRECT_PROXY ?? process.env.OPENCODE_RELAY_DIRECT_PROXY ?? ""
 const TRACE = "https://www.cloudflare.com/cdn-cgi/trace"
 
-// The native exit: the second bucket. Measured with the proxy bypassed,
-// exactly like the relay's own "direct" leg (Bun only bypasses the proxy
-// through NO_PROXY).
-async function nativeExit(): Promise<{ ip?: string; warp?: string }> {
+// The direct exit: the second bucket. Measured through the direct proxy (an
+// explicit proxy that connects with a raw socket - the opencode-warp stack's
+// egress-proxy.py with --upstream direct) when one is configured. The old
+// NO_PROXY bypass cannot be used for this: Bun < 1.4 ignores NO_PROXY
+// entirely, so the "direct" leg came out of the same exit IP as the tunnel.
+async function directExit(): Promise<{ ip?: string; warp?: string; how: string }> {
+  if (directProxy) {
+    try {
+      const r = await fetch(TRACE, {
+        proxy: directProxy,
+        signal: AbortSignal.timeout(8000),
+      } as RequestInit)
+      const t = await r.text()
+      return {
+        ip: /ip=([^\n\r]+)/.exec(t)?.[1],
+        warp: /warp=(\w+)/.exec(t)?.[1],
+        how: directProxy,
+      }
+    } catch (e) {
+      return { how: directProxy }
+    }
+  }
+  // No direct proxy: the NO_PROXY bypass. Works on Bun >= 1.4 only.
   const savedNO = process.env.NO_PROXY
   const savedno = process.env.no_proxy
   const host = new URL(TRACE).hostname
@@ -149,9 +170,13 @@ async function nativeExit(): Promise<{ ip?: string; warp?: string }> {
   try {
     const r = await fetch(TRACE, { signal: AbortSignal.timeout(8000) })
     const t = await r.text()
-    return { ip: /ip=([^\n\r]+)/.exec(t)?.[1], warp: /warp=(\w+)/.exec(t)?.[1] }
+    return {
+      ip: /ip=([^\n\r]+)/.exec(t)?.[1],
+      warp: /warp=(\w+)/.exec(t)?.[1],
+      how: "the NO_PROXY bypass",
+    }
   } catch {
-    return {}
+    return { how: "nothing" }
   } finally {
     if (savedNO === undefined) delete process.env.NO_PROXY
     else process.env.NO_PROXY = savedNO
@@ -186,20 +211,28 @@ if (proxy) {
   warn("no proxied leg - only one exit IP, so one bucket")
 }
 
-const native = await nativeExit()
+const native = await directExit()
 if (native.ip) {
   if (proxiedIp && native.ip === proxiedIp) {
     // Same IP on both legs: the tunnel IS the machine's egress (system
     // proxy / TUN), so bypassing the proxy changes nothing. One bucket -
     // and the only way to a new one is to rotate the registration.
     warn(
-      `the native exit is the SAME ip as the proxied one (${native.ip}, warp=${native.warp ?? "?"}) - ` +
-        `the tunnel is this machine's system egress, so both legs are ONE bucket. ` +
-        `A new bucket comes from rotating the registration (warp-rotate), not from the ladder.`,
+      `the direct exit is the SAME ip as the proxied one (${native.ip}, warp=${native.warp ?? "?"}) - ` +
+        `one bucket only. A new bucket comes from rotating the registration (warp-rotate), ` +
+        `or from a direct proxy that leaves the tunnel (SAJILO_RELAY_DIRECT_PROXY).`,
     )
   } else {
-    ok(`native exit: ip=${native.ip} warp=${native.warp ?? "off"} - a second bucket`)
+    ok(
+      `direct exit: ip=${native.ip} warp=${native.warp ?? "off"} - a second bucket (via ${native.how})`,
+    )
   }
+} else {
+  warn(
+    `the direct exit could not be measured${directProxy ? ` (${directProxy} did not answer)` : ""} - ` +
+      `on Bun < 1.4 NO_PROXY is ignored, so the direct leg stays in the tunnel unless ` +
+      `SAJILO_RELAY_DIRECT_PROXY names a proxy that connects directly`,
+  )
 }
 
 // --- the reset record --------------------------------------------------------

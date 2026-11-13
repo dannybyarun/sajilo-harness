@@ -46,6 +46,7 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { connect } from "node:net"
 
 /**
  * Environment lookup. SAJILO_* is canonical; the OPENCODE_* names stay as
@@ -868,6 +869,120 @@ function withHost(list: string, host: string): string {
   return parts.join(",")
 }
 
+// ---- the direct leg: the device's own egress (a second bucket) -------------
+//
+// The free allowance is keyed on the exit IP, so a second exit is a second
+// bucket. The proxied leg goes out through the tunnel; the direct leg is the
+// device's own route.
+//
+// The old way of reaching it - "add the host to NO_PROXY and fetch" - was
+// measured on Bun 1.4.4 and DOES work there. On Bun 1.3.9 it does not:
+// NO_PROXY=host, NO_PROXY=*, NO_PROXY=.host and proxy:'' ALL tunnelled, so
+// both legs came out of the same exit IP and the ladder had nothing to climb
+// (measured: 2a09:bac5:4e7b:11c3::1c5:132 warp=on on every one of them).
+//
+// So the direct leg can name an EXPLICIT proxy that connects directly: the
+// opencode-warp stack's egress-proxy.py with --upstream direct. That shim
+// opens a raw socket (no proxy in between), and because it only tunnels the
+// bytes the TLS fingerprint is still Bun's - which the gateway's whitelist
+// requires. Measured: through the shim the exit is the device's own
+// (27.34.64.28 / 2400:1a00:..., warp=off) while the tunnel leg is
+// 2a09:bac5:... (warp=on). Two buckets, and a real one.
+//
+//   SAJILO_RELAY_DIRECT_PROXY=http://127.0.0.1:40001
+//
+// The relay starts that shim itself if the stack and python are here.
+let directProxyStarted = false
+
+/** The stack's bin directory - the rotator lives next to the shim. */
+function stackDir(): string {
+  const rotator =
+    env("RELAY_ROTATOR") ??
+    (process.platform === "win32"
+      ? `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`
+      : "/usr/local/lib/opencode-warp/warp-rotate.sh")
+  return rotator.replace(/[/\\][^/\\]*$/, "")
+}
+
+/** Is something listening on this host:port? */
+function tcpAlive(host: string, port: number, timeoutMs = 1500): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (ok: boolean) => {
+      if (settled) return
+      settled = true
+      try {
+        sock.destroy()
+      } catch {
+        /* ignore */
+      }
+      resolve(ok)
+    }
+    const sock = connect({ host, port })
+    sock.setTimeout(timeoutMs)
+    sock.once("connect", () => done(true))
+    sock.once("timeout", () => done(false))
+    sock.once("error", () => done(false))
+  })
+}
+
+/**
+ * Resolve the direct leg's proxy: the configured one, started if it is not
+ * answering yet. Returns null when there is no direct proxy (the caller then
+ * falls back to the NO_PROXY bypass, which works on Bun >= 1.4).
+ */
+async function ensureDirectProxy(): Promise<string | null> {
+  const configured = env("RELAY_DIRECT_PROXY")
+  if (!configured) return null
+  let host = "127.0.0.1"
+  let port = 0
+  try {
+    const u = new URL(configured)
+    host = u.hostname
+    port = Number(u.port || (u.protocol === "https:" ? 443 : 80))
+  } catch {
+    return null
+  }
+  if (await tcpAlive(host, port)) return configured
+  if (directProxyStarted) return null
+  directProxyStarted = true
+  const shim = `${stackDir()}/egress-proxy.py`
+  if (!existsSync(shim)) {
+    logActivity(
+      `[${new Date().toISOString()}] DIRECT-PROXY ${configured} is not answering and there is no egress shim at ${shim} - the direct leg stays on the tunnel`,
+    )
+    return null
+  }
+  logActivity(
+    `[${new Date().toISOString()}] DIRECT-PROXY starting the egress shim on ${host}:${port} (--upstream direct, so the second leg has its own exit IP)`,
+  )
+  try {
+    const proc = Bun.spawn(
+      ["python", shim, "--port", String(port), "--upstream", "direct"],
+      { stdout: "ignore", stderr: "ignore", stdin: "ignore" },
+    )
+    proc.unref()
+  } catch (e) {
+    logActivity(
+      `[${new Date().toISOString()}] DIRECT-PROXY could not start the shim: ${String(e).slice(0, 200)}`,
+    )
+    return null
+  }
+  for (let i = 0; i < 12; i++) {
+    await Bun.sleep(500)
+    if (await tcpAlive(host, port)) {
+      logActivity(
+        `[${new Date().toISOString()}] DIRECT-PROXY up on ${host}:${port} - the direct leg is a second exit now`,
+      )
+      return configured
+    }
+  }
+  logActivity(
+    `[${new Date().toISOString()}] DIRECT-PROXY the shim did not come up on ${host}:${port} - the direct leg stays on the tunnel`,
+  )
+  return null
+}
+
 /**
  * fetch() with an optional proxy bypass. Bun reads NO_PROXY when the request
  * is issued, so the env is patched around the synchronous call and restored
@@ -879,7 +994,7 @@ function withHost(list: string, host: string): string {
  * egress is an independent quota bucket, so a dead proxy must not kill the
  * request).
  */
-function fetchUpstream(
+async function fetchUpstream(
   target: string,
   init: RequestInit,
   forceDirect = false,
@@ -892,6 +1007,12 @@ function fetchUpstream(
     return fetch(target, { ...init, proxy } as RequestInit)
   }
   if (!forceDirect && !directEgressEnabled()) return fetch(target, init)
+  // The direct leg: an explicit proxy that connects directly. This is the
+  // only way to leave the tunnel on Bun < 1.4 (NO_PROXY is ignored there).
+  const direct = await ensureDirectProxy()
+  if (direct) {
+    return fetch(target, { ...init, proxy: direct } as RequestInit)
+  }
   let host = ""
   try {
     host = new URL(target).hostname
@@ -1577,7 +1698,7 @@ function startServer(): void {
                 // climbing the ladder instead of answering the 429.
                 if (resp.status === 429 && egress === "proxy" && egressLadder().length > 1) {
                   logActivity(
-                    `[${new Date().toISOString()}] SPIN 429 via the proxied egress (${wanted}): that bucket is drained - trying the native egress`,
+                    `[${new Date().toISOString()}] SPIN 429 via the proxied egress (${wanted}): that bucket is drained - trying the direct egress`,
                   )
                   try {
                     await resp.body?.cancel()
@@ -2153,6 +2274,16 @@ export async function startRelay(): Promise<void> {
       `[${new Date().toISOString()}] RELAY-LISTENING build=${BUILD} port=${PORT}`,
     )
     startWatchdog()
+    // Bring the second leg up in the background: it is the device's own exit
+    // IP, which is a second quota bucket. Fire and forget - the activation
+    // budget is 5 s and the first request must not wait for it.
+    if (env("RELAY_DIRECT_PROXY")) {
+      void ensureDirectProxy()
+    } else {
+      logActivity(
+        `[${new Date().toISOString()}] DIRECT-PROXY not configured - the direct leg cannot leave the tunnel on this Bun (NO_PROXY is ignored below 1.4). Set SAJILO_RELAY_DIRECT_PROXY=http://127.0.0.1:40001 for a second bucket.`,
+      )
+    }
 
 // Proactive tunnel watchdog: probe the WARP egress every few minutes and
 // repair it from a cold start if it is down - independent of traffic, so
