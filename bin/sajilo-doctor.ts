@@ -115,6 +115,34 @@ try {
   warn(`live harness unreadable: ${e}`)
 }
 
+// --- the tunnel --------------------------------------------------------------
+// The rotatable tunnel is what makes a NEW exit IP - a new exit IP is a new
+// quota bucket. Without it the relay still resets the identity, but the
+// ladder has one bucket instead of two.
+console.log("\ntunnel")
+try {
+  const recorded = existsSync(join(STATE, "tunnel.txt"))
+    ? readFileSync(join(STATE, "tunnel.txt"), "utf8").trim()
+    : ""
+  const stackBin = join(process.env.LOCALAPPDATA ?? "", "opencode-warp", "bin")
+  const rotator = join(stackBin, "warp-rotate.cmd")
+  const hasStack = existsSync(rotator)
+  const hasUsque = existsSync("/usr/local/bin/usque")
+  if (hasStack) {
+    ok(`rotatable tunnel: the WARP stack is there (${stackBin}) - a rotation is a new exit IP`)
+  } else if (hasUsque) {
+    ok("rotatable tunnel: usque is installed - a rotation is a new exit IP")
+  } else if (recorded.startsWith("unavailable")) {
+    warn("no rotatable tunnel - the relay resets the identity instead (one bucket, not two)")
+  } else if (recorded) {
+    warn(`the tunnel was not set up (${recorded}) - the relay resets the identity instead`)
+  } else {
+    warn("no tunnel record - run the installer again, or install the WARP stack (dannybyarun/opencode-warp)")
+  }
+} catch (e) {
+  warn(`tunnel check failed: ${e}`)
+}
+
 // --- the egress -------------------------------------------------------------
 // The free allowance is keyed on the exit IP, so the egress matters: a second
 // egress is a second bucket.

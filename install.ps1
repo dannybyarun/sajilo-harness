@@ -143,6 +143,106 @@ if ($Here) {
 }
 Say "launcher installed -> $BinDir\sajilo.cmd"
 
+# ---------------------------------------------------------------- tunnel
+# The rotatable tunnel is what makes a NEW exit IP - and a new exit IP is a
+# new quota bucket. It is a separate stack (dannybyarun/opencode-warp):
+# Cloudflare WARP in proxy mode on Windows, usque (a WARP MASQUE
+# reimplementation) on Linux.
+#
+# This step attaches it automatically, so a machine that never had it ends
+# up with it. It is best effort: the relay works without a tunnel (it resets
+# the identity instead), so a failure here NEVER fails the install. Set
+# SAJILO_SKIP_TUNNEL=1 to skip it.
+#
+# The stack needs Administrator rights (it installs a service and a WARP
+# registration), so when it is missing the installer re-launches itself
+# elevated and Windows asks once (UAC).
+
+function Test-TcpPort([int]$Port, [int]$TimeoutMs = 800) {
+  try {
+    $c = New-Object System.Net.Sockets.TcpClient
+    $iar = $c.BeginConnect("127.0.0.1", $Port, $null, $null)
+    $ok = $iar.AsyncWaitHandle.WaitOne($TimeoutMs) -and $c.Connected
+    $c.Close()
+    return $ok
+  } catch {
+    return $false
+  }
+}
+
+function Get-TunnelState {
+  $stackBin = Join-Path $env:LOCALAPPDATA "opencode-warp\bin"
+  $hasStack = (Test-Path (Join-Path $stackBin "warp-rotate.cmd")) -and
+              (Test-Path (Join-Path $stackBin "probe.cmd"))
+  $warpCli = "C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe"
+  $hasWarp = Test-Path $warpCli
+  $proxyUp = Test-TcpPort 40000
+  $kind = "none"
+  if ($hasStack -and $proxyUp) { $kind = "warp-stack" }
+  elseif ($hasWarp -and $proxyUp) { $kind = "warp-only" }
+  return [pscustomobject]@{ Kind = $kind; HasStack = $hasStack; HasWarp = $hasWarp; ProxyUp = $proxyUp; StackBin = $stackBin }
+}
+
+function Install-Tunnel {
+  # The stack's own setup: it installs Cloudflare WARP (winget, else the
+  # MSI), creates the registration and puts WARP into proxy mode on
+  # 127.0.0.1:40000. -SkipOpenCodeInstall because this installer already
+  # handles opencode.
+  $url = "https://raw.githubusercontent.com/dannybyarun/opencode-warp/main/windows/setup.ps1"
+  $tmp = Join-Path $env:TEMP "opencode-warp-setup.ps1"
+  Say "tunnel: fetching the WARP stack setup"
+  try {
+    & curl.exe -fsSL -o $tmp $url
+    if ($LASTEXITCODE -ne 0) { throw "download failed: $url" }
+  } catch {
+    Note "tunnel: could not download the setup ($($_.Exception.Message))"
+    return $false
+  }
+  $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  if (-not $isAdmin) {
+    Note "tunnel: Windows will ask for administrator rights once (UAC)"
+    try {
+      $p = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $tmp, "-SkipOpenCodeInstall"
+      )
+      if ($p.ExitCode -ne 0) { Note "tunnel: the elevated setup exited with $($p.ExitCode)" }
+    } catch {
+      Note "tunnel: the elevated setup did not run ($($_.Exception.Message))"
+    }
+  } else {
+    try {
+      & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmp -SkipOpenCodeInstall
+    } catch {
+      Note "tunnel: the setup failed ($($_.Exception.Message))"
+    }
+  }
+  Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+  return $true
+}
+
+$tunnel = Get-TunnelState
+if ($env:SAJILO_SKIP_TUNNEL -eq "1") {
+  Say "tunnel skipped (SAJILO_SKIP_TUNNEL=1) - the relay will use the machine's own egress"
+  "skipped by SAJILO_SKIP_TUNNEL=1" | Set-Content (Join-Path $StateDir "tunnel.txt")
+} elseif ($tunnel.Kind -eq "warp-stack") {
+  Say "tunnel: the rotatable WARP proxy is already there ($($tunnel.StackBin))"
+  "warp-stack: $($tunnel.StackBin)" | Set-Content (Join-Path $StateDir "tunnel.txt")
+} else {
+  Note "tunnel: no rotatable WARP proxy found - installing it now"
+  if (Install-Tunnel) {
+    $tunnel = Get-TunnelState
+    if ($tunnel.Kind -eq "warp-stack") {
+      Say "tunnel: the rotatable WARP proxy is up (127.0.0.1:40000)"
+      "warp-stack: $($tunnel.StackBin)" | Set-Content (Join-Path $StateDir "tunnel.txt")
+    } else {
+      Note "tunnel: still not there - the relay will use the machine's own egress"
+      "unavailable: $($tunnel.Kind)" | Set-Content (Join-Path $StateDir "tunnel.txt")
+    }
+  } else {
+    "unavailable: could not install" | Set-Content (Join-Path $StateDir "tunnel.txt")
+  }
+}
+
 # ---------------------------------------------------------------- opencode
 # cmd.exe can run a .cmd or an .exe, but NOT a .ps1 shim, so only accept
 # something cmd.exe can execute directly.

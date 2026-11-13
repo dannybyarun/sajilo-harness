@@ -132,6 +132,85 @@ chmod +x "$BIN_DIR/sajilo" 2>/dev/null || true
 chmod +x "$BIN_DIR"/*.sh 2>/dev/null || true
 say "launcher installed -> $BIN_DIR/sajilo"
 
+# ---------------------------------------------------------------- tunnel
+# The rotatable tunnel is what makes a NEW exit IP - and a new exit IP is a
+# new quota bucket. It is a separate stack (dannybyarun/opencode-warp): usque
+# (a WARP MASQUE reimplementation) as a systemd service on Linux, Cloudflare
+# WARP in proxy mode on Windows.
+#
+# This step attaches it automatically, so a machine that never had it ends up
+# with it. It is best effort: the relay works without a tunnel (it resets the
+# identity instead), so a failure here NEVER fails the install. Set
+# SAJILO_SKIP_TUNNEL=1 to skip it.
+WARP_REPO_URL="https://raw.githubusercontent.com/dannybyarun/opencode-warp/main"
+
+tunnel_state() {
+  if [ -x /usr/local/bin/usque ] || command -v usque >/dev/null 2>&1; then
+    echo "usque: $(command -v usque || echo /usr/local/bin/usque)"
+  elif [ -f /usr/local/lib/opencode-warp/warp-rotate.sh ]; then
+    echo "warp-stack: /usr/local/lib/opencode-warp"
+  else
+    echo "none"
+  fi
+}
+
+install_tunnel() {
+  tmp=$(mktemp -d 2>/dev/null || echo "$TMPDIR/sajilo-tunnel.$$")
+  mkdir -p "$tmp"
+  ok=1
+  for f in setup.sh usque-setup.sh; do
+    curl -fsSL "$WARP_REPO_URL/$f" -o "$tmp/$f" 2>/dev/null || ok=0
+  done
+  if [ "$ok" != "1" ]; then
+    say "tunnel: could not download the WARP stack setup"
+    return 1
+  fi
+  chmod +x "$tmp"/*.sh 2>/dev/null || true
+  # The stack installs into /usr/local, so it needs root. sudo asks for the
+  # password once; without sudo we say exactly what to run and move on.
+  if [ "$(id -u)" -eq 0 ]; then
+    SUDO=""
+  elif command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  else
+    say "tunnel: needs root - run: sudo sh $tmp/setup.sh && sudo sh $tmp/usque-setup.sh"
+    return 1
+  fi
+  note "tunnel: installing the WARP stack (usque)"
+  $SUDO sh "$tmp/setup.sh" >/dev/null 2>&1 || true
+  # usque is the rotatable proxy: a systemd service on 127.0.0.1:40001.
+  if command -v systemctl >/dev/null 2>&1; then
+    $SUDO sh "$tmp/usque-setup.sh" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$tmp" 2>/dev/null || true
+  return 0
+}
+
+if [ "${SAJILO_SKIP_TUNNEL:-}" = "1" ]; then
+  say "tunnel skipped (SAJILO_SKIP_TUNNEL=1) - the relay will use the machine's own egress"
+  echo "skipped by SAJILO_SKIP_TUNNEL=1" >"$STATE_DIR/tunnel.txt"
+else
+  TUNNEL="$(tunnel_state)"
+  if [ "$TUNNEL" != "none" ]; then
+    say "tunnel: the rotatable WARP proxy is already there ($TUNNEL)"
+    echo "$TUNNEL" >"$STATE_DIR/tunnel.txt"
+  else
+    note "tunnel: no rotatable WARP proxy found - installing it now"
+    if install_tunnel; then
+      TUNNEL="$(tunnel_state)"
+      if [ "$TUNNEL" != "none" ]; then
+        say "tunnel: the rotatable WARP proxy is up ($TUNNEL)"
+        echo "$TUNNEL" >"$STATE_DIR/tunnel.txt"
+      else
+        say "tunnel: still not there - the relay will use the machine's own egress"
+        echo "unavailable" >"$STATE_DIR/tunnel.txt"
+      fi
+    else
+      echo "unavailable" >"$STATE_DIR/tunnel.txt"
+    fi
+  fi
+fi
+
 # ---------------------------------------------------------------- opencode
 find_opencode() {
   if [ "${SAJILO_FORCE_DOWNLOAD:-}" = "1" ]; then

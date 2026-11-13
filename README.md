@@ -77,7 +77,14 @@ bash install.sh
 | harness spec | the relay plugin and the prompt/tool resources, from the clone or downloaded from the repo |
 | launcher | `sajilo` on your PATH, plus a desktop shortcut (Windows) or launcher (Linux) |
 | runtime | your existing opencode is used and pinned; if the machine has none, the standalone build is downloaded into the instance |
-| tunnel | `usque`/WARP is used where it exists, otherwise the native egress |
+| **tunnel** | the rotatable WARP proxy is **installed if it is missing** - Cloudflare WARP in proxy mode on Windows, `usque` as a systemd service on Linux (the [opencode-warp](https://github.com/dannybyarun/opencode-warp) stack) |
+
+The tunnel step is what makes a **new exit IP** possible, and a new exit IP is
+a new quota bucket. It needs Administrator rights (it installs a service and
+a WARP registration), so on Windows the installer re-launches itself elevated
+and Windows asks once (UAC). It is **best effort**: a machine that cannot
+have the tunnel still gets a working relay - it resets the identity instead
+of rotating the IP. Skip it with `SAJILO_SKIP_TUNNEL=1`.
 
 Nothing is overwritten in your existing opencode: Sajilo keeps its own HOME,
 its own database and its own ports.
@@ -593,6 +600,7 @@ file.
 | `SAJILO_RELAY_RESET_COOLDOWN_MS` | how long the relay waits before starting a NEW reset (a storm of 429s shares one reset) (default 20000) |
 | `SAJILO_RELAY_AUTOMINT=0` | disable the automatic identity rotation |
 | `SAJILO_RELAY_EGRESS_ROTATE=0` | the reset refreshes the credential but does not touch the egress |
+| `SAJILO_SKIP_TUNNEL=1` | the installer does not install the rotatable WARP tunnel (the relay resets the identity instead) |
 | `OPENCODE_BIN` | legacy alias for `SAJILO_BIN` |
 
 The `OPENCODE_RELAY_*` names still work everywhere a `SAJILO_RELAY_*` name is
