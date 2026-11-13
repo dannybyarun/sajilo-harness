@@ -910,22 +910,35 @@ function startReset(reason: string): Promise<ResetResult> {
 }
 
 /**
+ * The models the relay may fall back to when the requested one is spent for
+ * the whole account. Three, not ten: the strong ones among the free models.
+ * The requested model is always tried FIRST and for as long as it can -
+ * this only matters once its allowance is empty for the account, and then
+ * the choice is between a good answer and no answer.
+ */
+const STRONG_POOL = [
+  "minimax-m3.1-flash-free",
+  "deepseek-v4.1-flash-free",
+  "mimo-v2.6-flash-free",
+]
+
+/**
  * The models that may answer when the requested one is spent for the whole
  * account.
  *
  * Off by default: the requested model is always preferred, and only the
  * reset can change the identity. But when the gateway says the model's
  * allowance refills in HOURS, no rotation helps - the session simply stalls
- * until the window rolls over. Set SAJILO_RELAY_FALLBACK_MODEL=auto (or a
- * comma-separated list) to let another free model answer instead: the
- * response says which model served (x-sajilo-model), and the harness prompt
- * is filled with that model too.
+ * until the window rolls over. Set SAJILO_RELAY_FALLBACK_MODEL=auto (the
+ * three strong ones) or a comma-separated list to let another model answer
+ * instead: the response says which model served (x-sajilo-model), and the
+ * harness prompt is filled with that model too.
  */
 function fallbackModels(current: string): string[] {
   const cfg = (env("RELAY_FALLBACK_MODEL") ?? "").trim()
   if (!cfg) return []
   if (cfg.toLowerCase() === "auto") {
-    return FREE_POOL_FALLBACK.filter((m) => m !== current)
+    return STRONG_POOL.filter((m) => m !== current)
   }
   return cfg
     .split(",")

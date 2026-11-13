@@ -139,6 +139,12 @@ if "%SAJILO_RELAY_ROTATOR%"=="" (
     if exist "%ROOT%\bin\usque-rotate.cmd" set "SAJILO_RELAY_ROTATOR=%ROOT%\bin\usque-rotate.cmd"
   )
 )
+REM The model the relay may fall back to when the requested one is spent for
+REM the whole account. "auto" is the three strong ones among the free models
+REM (minimax, deepseek, mimo). The requested model is always tried FIRST and
+REM for as long as it can; this only matters once its allowance is empty.
+REM Set SAJILO_RELAY_FALLBACK_MODEL= to turn the fallback off.
+if "%SAJILO_RELAY_FALLBACK_MODEL%"=="" set "SAJILO_RELAY_FALLBACK_MODEL=auto"
 REM The SECOND leg of the egress ladder: the device's OWN exit, not the
 REM tunnel's. The shim (egress-proxy.py --upstream direct) connects with a
 REM raw socket, so it leaves the tunnel - and a different exit IP is a

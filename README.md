@@ -355,6 +355,24 @@ There are **two kinds** of exhaustion, and the relay tells them apart:
   cycle the relay stops spinning and answers with the gateway's own refill
   time instead of burning the caller's time.
 
+And when it is the *model* that is spent (measured: deepseek 429s while eight
+of the other nine free models serve 200 at the same moment, and a different
+exit IP does not help), the relay falls back to another of the **three strong
+free models - minimax, deepseek, mimo**:
+
+```
+08:43:18.4  deepseek 429 (the ladder's two legs, then the reset cycle)
+08:43:42.8  the model is spent for the whole account - falling back to
+            minimax-m3.1-flash-free
+08:43:42.8  SERVED minimax-m3.1-flash-free, x-sajilo-model:
+            minimax-m3.1-flash-free
+```
+
+The requested model is always tried **first**, and for as long as it can - the
+fallback only happens once the model's allowance is empty for the account, so
+the choice is between a good answer and no answer. Set
+`SAJILO_RELAY_FALLBACK_MODEL=` to turn it off, or name your own list.
+
 The caller never sees a rate-limit error. If the client is still there when
 the ceiling is reached, the relay answers **503** with the gateway's own
 `Retry-After` - a retryable status that is not a quota error - and the reset
@@ -622,7 +640,7 @@ file.
 | `SAJILO_FORCE_DOWNLOAD` | `1` = ignore the installed runtime, fetch a private one into the instance |
 | `SAJILO_RELAY_PROXY` | the proxy for the tunnel leg of the egress ladder (default: the ambient `HTTPS_PROXY`) |
 | `SAJILO_RELAY_DIRECT_PROXY` | an explicit proxy for the direct leg - one that connects directly (the opencode-warp stack's `egress-proxy.py --upstream direct`). The relay starts it if it is not running. Without it the direct leg stays in the tunnel on Bun < 1.4, because `NO_PROXY` is ignored there |
-| `SAJILO_RELAY_FALLBACK_MODEL` | `auto`, or a comma-separated list: when the requested model is spent for the whole account, another free model answers instead of stalling until the window rolls over. Off by default - the requested model is always tried first, and the response says which model served (`x-sajilo-model`) |
+| `SAJILO_RELAY_FALLBACK_MODEL` | `auto` (the three strong free models: **minimax, deepseek, mimo**), or a comma-separated list: when the requested model is spent for the whole account, another model answers instead of stalling until the window rolls over. The requested model is always tried first and for as long as it can, and the response says which model served (`x-sajilo-model`). Set it to empty to turn the fallback off |
 | `SAJILO_RELAY_KEEP_WORKING_MS` | how long the relay keeps working on one request - waiting out refills, resetting the identity, rotating the egress - before it answers a retryable 503 (default 240000; Bun's idle cap is 255 s, so a longer hold would have its socket cut) |
 | `SAJILO_RELAY_MAX_RESETS` | a safety valve on the resets per request; `0` = unlimited, the ceiling above is the only limit (default 0) |
 | `SAJILO_RELAY_WAIT_MAX_SECONDS` | the longest refill the relay waits out instead of resetting the identity (default 45) |
