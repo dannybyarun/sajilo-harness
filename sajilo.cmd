@@ -131,10 +131,13 @@ if "%SAJILO_RELAY_PROXY%"=="" (
 )
 REM The rotator that gives the tunnel a new identity. The WARP app's own
 REM rotation comes first (fast); the instance's usque rotator is the
-REM admin-free alternative.
+REM admin-free alternative, used only when there is no app.
 if "%SAJILO_RELAY_ROTATOR%"=="" (
-  if exist "%LOCALAPPDATA%\opencode-warp\bin\warp-rotate.cmd" set "SAJILO_RELAY_ROTATOR=%LOCALAPPDATA%\opencode-warp\bin\warp-rotate.cmd"
-  if exist "%ROOT%\bin\usque-rotate.cmd" set "SAJILO_RELAY_ROTATOR=%ROOT%\bin\usque-rotate.cmd"
+  if exist "%LOCALAPPDATA%\opencode-warp\bin\warp-rotate.cmd" (
+    set "SAJILO_RELAY_ROTATOR=%LOCALAPPDATA%\opencode-warp\bin\warp-rotate.cmd"
+  ) else (
+    if exist "%ROOT%\bin\usque-rotate.cmd" set "SAJILO_RELAY_ROTATOR=%ROOT%\bin\usque-rotate.cmd"
+  )
 )
 REM The SECOND leg of the egress ladder: the device's OWN exit, not the
 REM tunnel's. The shim (egress-proxy.py --upstream direct) connects with a
