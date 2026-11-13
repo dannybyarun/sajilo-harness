@@ -642,6 +642,9 @@ let lastResetAt = 0
 // A reset is expensive (it spawns a real opencode run), so a storm of 429s
 // shares ONE reset instead of starting one each.
 const RESET_COOLDOWN_MS = Number(env("RELAY_RESET_COOLDOWN_MS") ?? 20_000)
+// How long the rotator may take before the relay gives up on it and carries
+// on. A rotation is normally 15-40 s.
+const ROTATE_TIMEOUT_MS = Number(env("RELAY_ROTATE_TIMEOUT_MS") ?? 45_000)
 
 /**
  * Experiment switch: allow the rescue chain to skip the WARP egress rotation
@@ -687,15 +690,18 @@ function instanceUsqueRotator(): string | undefined {
 }
 
 /**
- * Do the reset: rotate the egress, then mint a fresh session/project pair.
- * Never rejects - a failed reset is a result, not an exception.
+ * Rotate the egress: a new exit IP, which is a new quota bucket.
+ *
+ * This is the FAST leg of a reset - the rotator replaces the tunnel
+ * registration and is back in seconds. The identity (the mint) is the slow
+ * leg, so they are kicked separately and the caller retries as soon as the
+ * fast one is done.
  */
-async function performReset(reason: string): Promise<ResetResult> {
-  const before = sessionID()
-  const rotateEgress = egressRotationEnabled()
-  // The rotator and the reset log are per-instance: the sajilo instance must
-  // rotate ITS OWN tunnel. A hardcoded path meant sajilo's rescue chain
-  // rotated the LIVE tunnel.
+async function performEgressRotation(reason: string): Promise<boolean> {
+  if (!egressRotationEnabled()) return false
+  // The rotator is per-instance: the sajilo instance must rotate ITS OWN
+  // tunnel. A hardcoded path meant sajilo's rescue chain rotated the LIVE
+  // tunnel.
   //
   // Windows has its own rotator: the instance's usque-rotate.cmd (usque is a
   // user-space WARP client, so rotating it needs no administrator rights).
@@ -704,8 +710,7 @@ async function performReset(reason: string): Promise<ResetResult> {
   const ROTATOR = isWindows
     ? (env("RELAY_ROTATOR") ?? instanceUsqueRotator() ?? `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`)
     : (env("RELAY_ROTATOR") ?? "/usr/local/lib/opencode-warp/warp-rotate.sh")
-  const RESCUE_LOG =
-    env("RELAY_RESCUE_LOG") ?? "/tmp/sajilo/rescue.log"
+  const RESCUE_LOG = env("RELAY_RESCUE_LOG") ?? "/tmp/sajilo/rescue.log"
   const transcript = (line: string) => {
     try {
       mkdirSync(RESCUE_LOG.replace(/[/\\][^/\\]*$/, ""), { recursive: true })
@@ -715,44 +720,91 @@ async function performReset(reason: string): Promise<ResetResult> {
     }
   }
   transcript(
-    `--- reset ${new Date().toISOString()} (${reason}) egress-rotate=${rotateEgress} ---`,
+    `--- reset ${new Date().toISOString()} (${reason}) egress-rotate=true ---`,
   )
-
-  // The reset runs natively here - no shell, no quoting, no curl: it is two
-  // steps, and this process can do both itself. The old version shelled out to
-  // a script, which on Windows meant cmd.exe quoting hell: it failed
-  // instantly and never wrote a transcript.
   try {
-    if (rotateEgress) {
-      // Rotate the egress: a new exit IP is a new quota bucket. Restart
-      // first on unix (cheap, keeps the working account); Windows has only
-      // --rotate-only, which replaces the WARP registration.
-      const attempts = isWindows
-        ? [[ROTATOR, "--rotate-only"]]
-        : [
-            [ROTATOR, "--restart-only"],
-            [ROTATOR, "--rotate-only"],
-          ]
-      for (const attempt of attempts) {
-        const [bin, ...args] = attempt
-        const proc = Bun.spawn(
-          isWindows ? ["cmd.exe", "/c", bin, ...args] : ["bash", bin, ...args],
-          { stdout: "pipe", stderr: "pipe", stdin: "ignore" },
-        )
-        const out = await proc.exited
-        let tail = ""
+    // Restart first on unix (cheap, keeps the working account); Windows has
+    // only --rotate-only, which replaces the registration.
+    const attempts = isWindows
+      ? [[ROTATOR, "--rotate-only"]]
+      : [
+          [ROTATOR, "--restart-only"],
+          [ROTATOR, "--rotate-only"],
+        ]
+    for (const attempt of attempts) {
+      const [bin, ...args] = attempt
+      const proc = Bun.spawn(
+        isWindows ? ["cmd.exe", "/c", bin, ...args] : ["bash", bin, ...args],
+        { stdout: "pipe", stderr: "pipe", stdin: "ignore" },
+      )
+      // Drain the child's output as it runs, and NEVER read the pipe to EOF
+      // after it exits: the rotator starts the NEW tunnel as a detached
+      // grandchild, and that grandchild inherits the pipe - so the pipe never
+      // reaches EOF and reading it hangs FOREVER. That hang is what parked
+      // the request that asked for the reset (the request gave up long before
+      // the reset had landed).
+      let tail = ""
+      const drain = (async () => {
         try {
-          tail = (await new Response(proc.stdout).text()).slice(-400)
+          const dec = new TextDecoder()
+          const reader = proc.stdout.getReader()
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            if (value) tail = (tail + dec.decode(value)).slice(-400)
+          }
         } catch {
-          /* ignore */
+          /* diagnostics only */
         }
-        transcript(`${bin} ${args.join(" ")} -> rc=${out} ${tail.trim()}`)
-        if (out === 0) break
-      }
-    } else {
-      transcript("egress rotation SKIPPED (experiment mode: pair-mint only)")
+      })()
+      // The rotator is bounded too: a rotator that hangs (or a tunnel that
+      // does not come back) must not park the request that asked for the
+      // reset. Measured: a rotation takes 15-40 s.
+      const out = await Promise.race([
+        proc.exited,
+        Bun.sleep(ROTATE_TIMEOUT_MS).then(() => {
+          try {
+            proc.kill()
+          } catch {
+            /* already gone */
+          }
+          return -1
+        }),
+      ])
+      void drain
+      transcript(`${bin} ${args.join(" ")} -> rc=${out} ${tail.trim()}`)
+      if (out === 0) break
+      if (out === -1) break
     }
+    return true
+  } catch (e) {
+    transcript(`egress rotation failed: ${String(e).slice(0, 300)}`)
+    return false
+  }
+}
 
+/**
+ * Mint a fresh session/project pair: a new identity, which is the other half
+ * of the bucket.
+ *
+ * This is the SLOW leg: the child has to boot opencode, make a real request
+ * (so the gateway knows the session) and finish, which is tens of seconds -
+ * and longer when the gateway is throttling, because then the child's own
+ * request stalls. So it runs in the background while the caller retries the
+ * model against the fresh EGRESS.
+ */
+async function performMint(reason: string): Promise<ResetResult> {
+  const before = sessionID()
+  const RESCUE_LOG = env("RELAY_RESCUE_LOG") ?? "/tmp/sajilo/rescue.log"
+  const transcript = (line: string) => {
+    try {
+      mkdirSync(RESCUE_LOG.replace(/[/\\][^/\\]*$/, ""), { recursive: true })
+      appendFileSync(RESCUE_LOG, line + "\n")
+    } catch {
+      /* diagnostics only */
+    }
+  }
+  try {
     // Mint a fresh pair. FORCED: the whole point of a reset is a fresh quota
     // bucket, so the mint cooldown must not skip it.
     const minted = await mintOnce(undefined, true)
@@ -779,15 +831,42 @@ async function performReset(reason: string): Promise<ResetResult> {
         : `the mint did not change the identity (${JSON.stringify(minted).slice(0, 160)})`,
     }
   } catch (e) {
-    transcript(`reset failed: ${String(e).slice(0, 300)}`)
+    transcript(`mint failed: ${String(e).slice(0, 300)}`)
     return { ok: false, session: sessionID(), note: String(e).slice(0, 300) }
   }
 }
 
+// The two legs, shared between the requests that hit the same wall: a storm
+// of 429s must not spawn one rotation or one opencode run each.
+let egressInFlight: Promise<boolean> | null = null
+let identityMintInFlight: Promise<ResetResult> | null = null
+
+function rotateEgress(reason: string): Promise<boolean> {
+  if (egressInFlight) return egressInFlight
+  const p = performEgressRotation(reason).finally(() => {
+    if (egressInFlight === p) egressInFlight = null
+  })
+  egressInFlight = p
+  return p
+}
+
+function mintIdentity(reason: string): Promise<ResetResult> {
+  if (identityMintInFlight) return identityMintInFlight
+  const p = performMint(reason).finally(() => {
+    if (identityMintInFlight === p) identityMintInFlight = null
+  })
+  identityMintInFlight = p
+  return p
+}
+
 /**
- * Start a reset, or join the one that is already running. The promise
- * settles when the fresh identity is in place - the caller then retries the
- * SAME model against it.
+ * Start a full reset (both legs), or join the one that is already running.
+ * The promise settles when the fresh identity is in place.
+ *
+ * The chat path does not use this: it rotates the egress and retries FIRST
+ * (that leg is seconds), and only waits for the identity if the fresh
+ * egress was not enough. This is for the paths that have no request to
+ * retry - the egress-unreachable repair.
  */
 function startReset(reason: string): Promise<ResetResult> {
   if (env("RELAY_AUTOMINT") === "0") {
@@ -809,16 +888,19 @@ function startReset(reason: string): Promise<ResetResult> {
     return Bun.sleep(cooldownLeft).then(() => startReset(reason))
   }
   lastResetAt = Date.now()
-  const p = performReset(reason)
+  const p = (async () => {
+    await rotateEgress(reason)
+    return await mintIdentity(reason)
+  })()
   resetInFlight = p
   p.finally(() => {
     if (resetInFlight === p) resetInFlight = null
   }).catch(() => {
-    /* performReset never rejects, but never leave a dangling rejection */
+    /* the legs never reject, but never leave a dangling rejection */
   })
   logActivity(
     `[${new Date().toISOString()}] RESET kicked (${reason}): ` +
-      `${egressRotationEnabled() ? "warp rotate + pair re-mint" : "pair re-mint only (egress rotation disabled)"}`,
+      `${egressRotationEnabled() ? "egress rotate + pair re-mint" : "pair re-mint only (egress rotation disabled)"}`,
   )
   return p
 }
@@ -955,7 +1037,15 @@ function tcpAlive(host: string, port: number, timeoutMs = 1500): Promise<boolean
  * falls back to the NO_PROXY bypass, which works on Bun >= 1.4).
  */
 async function ensureDirectProxy(): Promise<string | null> {
-  const configured = env("RELAY_DIRECT_PROXY")
+  // The launcher sets SAJILO_RELAY_DIRECT_PROXY; when the relay was started
+  // some other way (the standalone runner, a reload), fall back to the
+  // conventional port of the stack's egress shim - without it the ladder's
+  // second rung is the SAME bucket as the first on Bun < 1.4.
+  const configured =
+    env("RELAY_DIRECT_PROXY") ??
+    (existsSync(`${stackDir()}/egress-proxy.py`)
+      ? "http://127.0.0.1:40001"
+      : undefined)
   if (!configured) return null
   let host = "127.0.0.1"
   let port = 0
@@ -1155,7 +1245,19 @@ const MINT_COOLDOWN = 10 * 60_000
 // freshly minted session lives in one of them and must be harvestable.
 const EXCLUDED_DIRS = /^\/sdcard\/Yoyo(?:\/|$)/
 
-async function harvestPair(): Promise<{ session: string; project: string } | null> {
+/**
+ * Find a session to pin as the relay's identity.
+ *
+ * `since` (epoch ms) restricts the search to sessions CREATED after that
+ * moment, and the order is by time_created, NOT time_updated. That matters:
+ * opencode writes the session row when the run STARTS, but only touches
+ * time_updated when it ENDS - so ordering by time_updated could not see the
+ * fresh session until the child had finished its whole prompt. The child's
+ * prompt cannot finish while the gateway is throttling us, which is exactly
+ * when the mint runs - so the mint took the full timeout (measured: 60 s)
+ * instead of the few seconds the session actually needed.
+ */
+async function harvestPair(since = 0): Promise<{ session: string; project: string } | null> {
   try {
     const { Database } = await import("bun:sqlite")
     const db = new Database(`${process.env.HOME ?? "/root"}/.local/share/opencode/opencode.db`, { readonly: true })
@@ -1163,9 +1265,9 @@ async function harvestPair(): Promise<{ session: string; project: string } | nul
       const rows = db
         .query(
           "SELECT id, directory, project_id FROM session_v2 " +
-            "WHERE id LIKE 'ses_%' ORDER BY time_updated DESC",
+            "WHERE id LIKE 'ses_%' AND time_created > ? ORDER BY time_created DESC",
         )
-        .all() as Array<{ id: string; directory: string; project_id: string | null }>
+        .all(since) as Array<{ id: string; directory: string; project_id: string | null }>
       for (const r of rows) {
         if (r && r.id.startsWith("ses_") && !EXCLUDED_DIRS.test(r.directory ?? "")) {
           return { session: r.id, project: r.project_id ?? "" }
@@ -1208,6 +1310,11 @@ async function mintOnce(prompt?: string, force = false): Promise<Record<string, 
     // (which filters the harness project) can see the session it creates.
     const dir = `${MINT_DIR}/${Date.now().toString(36)}`
     mkdirSync(dir, { recursive: true })
+    // The moment the child is about to start: only sessions CREATED after
+    // this are the child's. That is how the harvest finds the child's session
+    // while the child is still running, instead of waiting for the run to
+    // finish (which cannot happen while the gateway is throttling us).
+    const mintStartedAt = Date.now() - 2_000
     // Strip the harness's own session id: the child must mint its OWN session.
     const env: Record<string, string> = {}
     for (const [k, v] of Object.entries(process.env)) {
@@ -1263,19 +1370,37 @@ async function mintOnce(prompt?: string, force = false): Promise<Record<string, 
         /* diagnostics only */
       }
     })()
+    // The child only has to CREATE a session - its prompt does not have to
+    // finish, and quite often it cannot: it talks to the same gateway we are
+    // being throttled by, so it sits there waiting for a window that will not
+    // open for hours. Waiting for it made every reset take the full 150 s
+    // timeout (the transcripts show rc=-1, the killed child), which is longer
+    // than the request that asked for the reset can wait - so the reset
+    // never landed in time and the caller got the 503 instead of an answer.
+    //
+    // So: watch the database for the child's session and stop the child the
+    // moment it appears.
+    const before = await harvestPair(mintStartedAt)
+    let pair: { session: string; project: string } | null = null
+    const deadline = Date.now() + 60_000
+    while (Date.now() < deadline) {
+      await Bun.sleep(1_000)
+      pair = await harvestPair(mintStartedAt)
+      if (pair && pair.session && pair.session !== before?.session) break
+    }
+    // The child has done its job. Stop it before it spends more quota (or
+    // keeps a session row around).
+    try {
+      proc.kill()
+    } catch {
+      /* already gone */
+    }
     const rc = await Promise.race([
       proc.exited,
-      Bun.sleep(150_000).then(() => {
-        try {
-          proc.kill()
-        } catch {
-          /* already gone */
-        }
-        return -1
-      }),
+      Bun.sleep(10_000).then(() => -1),
     ])
     void drain
-    const pair = await harvestPair()
+    if (!pair) pair = await harvestPair(mintStartedAt)
     if (pair) {
       await pinPair(pair)
       logActivity(
@@ -1678,6 +1803,13 @@ function startServer(): void {
           const spinStarted = Date.now()
           let fetchErrors = 0
           let resets = 0
+          // The two legs of a reset, per request: the egress (fast) and the
+          // identity (slow). The egress is tried first and the identity runs
+          // alongside it, so the caller retries the SAME model within seconds
+          // instead of waiting a minute for a mint.
+          let egressRotated = false
+          let egressPending: Promise<boolean> | null = null
+          let mintPending: Promise<ResetResult> | null = null
           outer: while (true) {
             if (Date.now() - spinStarted > KEEP_WORKING_MS) {
               // A reset that is still landing would give this request a fresh
@@ -1832,8 +1964,21 @@ function startServer(): void {
                 continue
               }
               // The window for THIS identity is empty. Reset it - a new egress
-              // and a new session/project pair - and retry the SAME model
-              // against the fresh identity.
+              // and a new session/project pair - and retry the SAME model.
+              //
+              // The two legs have very different costs. The egress rotation
+              // is SECONDS (the rotator replaces the registration and comes
+              // back); the identity mint is a MINUTE or more (a real
+              // opencode run has to boot, reach the gateway and finish, and
+              // when the gateway is throttling its own request stalls). So:
+              // rotate the egress and retry straight away, and let the mint
+              // run alongside it in the background. Only if the fresh egress
+              // was not enough do we wait for the identity.
+              //
+              // Waiting for the mint FIRST was the bug that made mid-session
+              // requests fail while fresh ones worked: the reset ate the
+              // whole budget and the caller got the 503 before the fix it
+              // asked for had landed.
               if (MAX_RESETS > 0 && resets >= MAX_RESETS) {
                 logActivity(
                   `[${new Date().toISOString()}] SPIN 429 on ${wanted} after ${resets} resets - giving up on this request`,
@@ -1841,34 +1986,61 @@ function startServer(): void {
                 break outer
               }
               resets++
-              logActivity(
-                `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window for this identity is empty - resetting the limit (reset ${resets}${MAX_RESETS > 0 ? `/${MAX_RESETS}` : ""})` +
-                  `${refillIn > 0 ? ` (the gateway says this window refills in ${refillIn}s)` : ""}`,
-              )
-              // Wait for the reset, but never past the ceiling: a reset that
-              // lands after the ceiling still helps the NEXT request.
-              const raced = await Promise.race([
-                startReset(`429-${wanted}`).then((reset) => ({ timedOut: false, reset })),
-                Bun.sleep(Math.max(0, remaining)).then(() => ({
-                  timedOut: true,
-                  reset: null as ResetResult | null,
-                })),
-              ])
-              if (raced.timedOut) {
+              if (!egressRotated) {
+                egressRotated = true
                 logActivity(
-                  `[${new Date().toISOString()}] SPIN ceiling reached while the reset was landing - answering with a retryable 503`,
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window is empty - rotating the egress (seconds) and minting a new identity in the background (a minute)` +
+                    `${refillIn > 0 ? ` (the gateway says this window refills in ${refillIn}s)` : ""}`,
                 )
-                break outer
+                // Both legs are kicked, and NEITHER is waited for here. The
+                // rotation may still be in flight when the retry goes out
+                // (the ladder's other leg can serve it), and the mint takes
+                // a minute. Waiting for either here is what made a long
+                // session fail while a fresh one worked: the reset ate the
+                // whole budget and the caller got the 503 before the fix it
+                // had asked for had landed.
+                egressPending = rotateEgress(`429-${wanted}`)
+                egressPending.catch(() => {
+                  /* performEgressRotation never rejects */
+                })
+                mintPending = mintIdentity(`429-${wanted}`)
+                mintPending.catch(() => {
+                  /* performMint never rejects */
+                })
+                continue
               }
-              if (!raced.reset?.ok) {
-                // The reset did not change the identity (it was skipped, or
-                // the mint failed). Back off instead of hammering a drained
-                // window - the next attempt still costs the caller nothing
-                // but time.
-                logActivity(
-                  `[${new Date().toISOString()}] RESET did not land (${raced.reset?.note ?? "unknown"}) - waiting 10s and retrying ${wanted}`,
-                )
-                await Bun.sleep(Math.min(10_000, Math.max(0, remaining)))
+              // The egress had its chance (and the rotation may have landed
+              // by now). Wait for it, but never past the ceiling.
+              if (egressPending) {
+                const raced = await Promise.race([
+                  egressPending.then(() => ({ timedOut: false })),
+                  Bun.sleep(Math.max(0, remaining)).then(() => ({ timedOut: true })),
+                ])
+                if (raced.timedOut) {
+                  logActivity(
+                    `[${new Date().toISOString()}] SPIN ceiling reached while the egress was rotating - answering with a retryable 503`,
+                  )
+                  break outer
+                }
+              }
+              // A fresh egress was not enough: now the identity is the
+              // bottleneck. Wait for the mint (it is already running).
+              logActivity(
+                `[${new Date().toISOString()}] SPIN 429 on ${wanted}: a fresh egress was not enough - waiting for the new identity`,
+              )
+              if (mintPending) {
+                const raced = await Promise.race([
+                  mintPending.then(() => ({ timedOut: false })),
+                  Bun.sleep(Math.max(0, remaining)).then(() => ({ timedOut: true })),
+                ])
+                if (raced.timedOut) {
+                  logActivity(
+                    `[${new Date().toISOString()}] SPIN ceiling reached while the identity was being minted - answering with a retryable 503`,
+                  )
+                  break outer
+                }
+              } else {
+                await mintIdentity(`429-${wanted}`)
               }
               continue
             }

@@ -331,6 +331,21 @@ The relay keeps going for as long as the client stays connected (4 minutes by
 default - the ceiling Bun's idle timeout allows). If the network itself dies, the egress is repaired in the
 background and the request is retried - it is never abandoned.
 
+The reset has **two legs**, and the order matters:
+
+| leg | cost | what it changes |
+|---|---|---|
+| the egress | seconds | a new exit IP - a new bucket |
+| the identity | a minute or more | a new session/project pair - a new bucket |
+
+The relay rotates the egress and retries the **same model** straight away,
+and lets the identity mint run alongside it in the background. Only if a
+fresh egress was not enough does it wait for the new identity.
+
+Waiting for the identity *first* was the bug that made a long session fail
+while a fresh one worked: the reset ate the whole budget, and the caller got
+the 503 before the fix it had asked for had landed.
+
 The caller never sees a rate-limit error. If the client is still there when
 the ceiling is reached, the relay answers **503** with the gateway's own
 `Retry-After` - a retryable status that is not a quota error - and the reset
