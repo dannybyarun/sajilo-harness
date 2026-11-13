@@ -2,7 +2,7 @@
 REM sajilo.cmd - launch sajilo, a coding agent harness on Windows.
 REM
 REM Sajilo is a COMPLETELY SEPARATE instance: its own HOME (USERPROFILE for
-REM Bun on Windows), its own project dir, its own relay on 43914, its own
+REM Bun on Windows), its own project dir, its own relay on 43915, its own
 REM pins, mint dir and logs. Nothing it does can touch an opencode you are
 REM already running.
 REM
@@ -33,7 +33,7 @@ REM to something else used to leave RELAY_PORT empty, which pointed the client
 REM at http://127.0.0.1/ (port 80) and made the relay bind a random
 REM ephemeral port.
 if "%SAJILO_RELAY_PORT%"=="" (
-  set "RELAY_PORT=43914"
+  set "RELAY_PORT=43915"
 ) else (
   set "RELAY_PORT=%SAJILO_RELAY_PORT%"
 )
@@ -98,8 +98,9 @@ set "SAJILO_RELAY_DUMP_DIR=%STATE%"
 set "SAJILO_RELAY_RUNTIME=%OPENCODE_BIN%"
 set "SAJILO_ROTATE_MARKER=%STATE%\.rotate.inprogress"
 REM The instance's own tunnel port: the usque proxy (and, on Linux, the
-REM usque tunnel) lives here.
-if "%SAJILO_TUNNEL_PORT%"=="" set "SAJILO_TUNNEL_PORT=40003"
+REM usque tunnel) lives here. It is NOT 40003 - that is opencode-v3's unix
+REM tunnel port, and two instances must never share a tunnel.
+if "%SAJILO_TUNNEL_PORT%"=="" set "SAJILO_TUNNEL_PORT=40005"
 REM The instance runs with its own egress: it clears the ambient proxy so it
 REM never shares a bucket with another opencode, and picks its own tunnel leg
 REM below.
@@ -129,14 +130,38 @@ if "%SAJILO_RELAY_PROXY%"=="" (
     set "SAJILO_RELAY_PROXY=http://127.0.0.1:%SAJILO_TUNNEL_PORT%"
   )
 )
-REM The rotator that gives the tunnel a new identity. The WARP app's own
-REM rotation comes first (fast); the instance's usque rotator is the
-REM admin-free alternative, used only when there is no app.
+REM The SECOND leg of the ladder: this instance's OWN tunnel. Its exit IP
+REM belongs to this instance alone - the WARP app's exit is shared with
+REM everything else on this machine - so it is a quota bucket nobody else is
+REM in. It is the second leg, not the first: rotating it registers a new
+REM anonymous account, which takes minutes, and the reset has to land inside
+REM the caller's budget.
+if "%SAJILO_RELAY_PROXY_ALT%"=="" (
+  if exist "%ROOT%\bin\usque.exe" (
+    if not exist "%ROOT%\tunnel" mkdir "%ROOT%\tunnel" >nul 2>&1
+    netstat -ano | findstr /R /C:"127.0.0.1:%SAJILO_TUNNEL_PORT% .*LISTENING" >nul 2>&1
+    if errorlevel 1 (
+      set "HTTPS_PROXY="
+      set "HTTP_PROXY="
+      start "" /b "%ROOT%\bin\usque.exe" -c "%ROOT%\tunnel\config.json" http-proxy -b 127.0.0.1 -p %SAJILO_TUNNEL_PORT% >>"%STATE%\usque.log" 2>>"%STATE%\usque.log.err"
+    )
+    call :sajilo_wait_port %SAJILO_TUNNEL_PORT%
+    if defined SAJILO_TUNNEL_UP set "SAJILO_RELAY_PROXY_ALT=http://127.0.0.1:%SAJILO_TUNNEL_PORT%"
+  )
+)
+REM The rotator that gives the tunnel a new identity. It MUST match the leg
+REM the relay is riding: rotating the WARP app while the relay rides its own
+REM tunnel changes nothing at all, and the reset then "succeeds" without
+REM moving the bucket.
 if "%SAJILO_RELAY_ROTATOR%"=="" (
   if exist "%LOCALAPPDATA%\opencode-warp\bin\warp-rotate.cmd" (
-    set "SAJILO_RELAY_ROTATOR=%LOCALAPPDATA%\opencode-warp\bin\warp-rotate.cmd"
-  ) else (
+    if "%SAJILO_RELAY_PROXY%"=="http://127.0.0.1:40000" set "SAJILO_RELAY_ROTATOR=%LOCALAPPDATA%\opencode-warp\bin\warp-rotate.cmd"
+  )
+  if "%SAJILO_RELAY_ROTATOR%"=="" (
     if exist "%ROOT%\bin\usque-rotate.cmd" set "SAJILO_RELAY_ROTATOR=%ROOT%\bin\usque-rotate.cmd"
+  )
+  if "%SAJILO_RELAY_ROTATOR%"=="" (
+    if exist "%LOCALAPPDATA%\opencode-warp\bin\warp-rotate.cmd" set "SAJILO_RELAY_ROTATOR=%LOCALAPPDATA%\opencode-warp\bin\warp-rotate.cmd"
   )
 )
 REM The model the relay may fall back to when the requested one is spent for
@@ -157,6 +182,7 @@ REM runs in a plain shell, with none of this env) can report the real legs
 REM instead of guessing.
 > "%STATE%\relay-env.txt" (
   echo SAJILO_RELAY_PROXY=%SAJILO_RELAY_PROXY%
+  echo SAJILO_RELAY_PROXY_ALT=%SAJILO_RELAY_PROXY_ALT%
   echo SAJILO_RELAY_DIRECT_PROXY=%SAJILO_RELAY_DIRECT_PROXY%
 )
 set "OPENCODE_RELAY_PROXY="
@@ -354,3 +380,17 @@ goto :do_run_next
 :do_run_exec
 "%OPENCODE_BIN%" run --standalone%ARGS%
 exit /b %errorlevel%
+
+REM --- wait for a local port to answer -----------------------------------------
+REM Used before the relay is pointed at the instance's own tunnel: a proxy
+REM that is not listening yet is a dead leg, and a dead leg wastes the
+REM caller's request instead of being climbed over.
+:sajilo_wait_port
+set "SAJILO_TUNNEL_UP="
+for /l %%I in (1,1,10) do (
+  netstat -ano | findstr /R /C:"127.0.0.1:%~1 .*LISTENING" >nul 2>&1 && set "SAJILO_TUNNEL_UP=1"
+  if defined SAJILO_TUNNEL_UP goto :sajilo_wait_port_done
+  ping -n 2 127.0.0.1 >nul
+)
+:sajilo_wait_port_done
+exit /b 0

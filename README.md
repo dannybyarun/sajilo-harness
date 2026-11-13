@@ -246,22 +246,22 @@ sajilo relay      # start the provider on its own (headless)
 ```
 
 ```
-sajilo relay listening on http://127.0.0.1:43914
-  models    : http://127.0.0.1:43914/v1/models
-  base url  : http://127.0.0.1:43914/v1
+sajilo relay listening on http://127.0.0.1:43915
+  models    : http://127.0.0.1:43915/v1/models
+  base url  : http://127.0.0.1:43915/v1
 ```
 
 Then point your agent at it:
 
 ```bash
 # any OpenAI SDK
-export OPENAI_BASE_URL=http://127.0.0.1:43914/v1
+export OPENAI_BASE_URL=http://127.0.0.1:43915/v1
 export OPENAI_API_KEY=anything          # the key is ignored
 ```
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:43914/v1", api_key="anything")
+client = OpenAI(base_url="http://127.0.0.1:43915/v1", api_key="anything")
 client.chat.completions.create(
     model="deepseek-v4.1-flash-free",
     messages=[{"role": "user", "content": "hello"}],
@@ -270,7 +270,7 @@ client.chat.completions.create(
 
 ```bash
 # curl
-curl http://127.0.0.1:43914/v1/chat/completions \
+curl http://127.0.0.1:43915/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}]}'
 ```
@@ -420,7 +420,7 @@ runtime
   ok    runtime: C:\Users\Arun\AppData\Roaming\npm\opencode.cmd
 
 relay
-  ok    listening on http://127.0.0.1:43914 (pid 19568, 0 requests served)
+  ok    listening on http://127.0.0.1:43915 (pid 19568, 0 requests served)
   ok    mode: harness=sajilo tools=sajilo auth=open
 
 gateway
@@ -515,7 +515,7 @@ startup and leaves every other key alone:
 ```jsonc
 {
   "mcp": { "servers": { "browse": { "type": "local", "command": ["browse", "mcp"] } } },
-  "provider": { "sajilo": { "name": "Sajilo", "options": { "baseURL": "http://127.0.0.1:43914/openai/v1" } } },
+  "provider": { "sajilo": { "name": "Sajilo", "options": { "baseURL": "http://127.0.0.1:43915/openai/v1" } } },
   "model": "sajilo/deepseek-v4.1-flash-free"
 }
 ```
@@ -564,7 +564,7 @@ canary: if it ever fails, something rotated a model again.
 | | Linux / macOS / WSL | Windows |
 |---|---|---|
 | separate HOME, DB, sessions, project | yes | yes |
-| own relay (port 43914) with ladder/budget/reset | yes | yes |
+| own relay (port 43915) with ladder/budget/reset | yes | yes |
 | own **rotatable** WARP tunnel | yes (`usque`) | yes (`usque` - no admin) |
 | egress recovery by rotating the IP | yes | yes - `usque-rotate.cmd` gives a new exit IP, no admin |
 | the live opencode is unaffected | yes | yes |
@@ -609,7 +609,7 @@ bun run <root>/bin/sajilo-relay.ts # the same thing, directly
 ```
 
 ```bash
-OPENAI_BASE_URL=http://127.0.0.1:43914/v1 OPENAI_API_KEY=public my-client
+OPENAI_BASE_URL=http://127.0.0.1:43915/v1 OPENAI_API_KEY=public my-client
 ```
 
 ## Layout
@@ -633,7 +633,7 @@ file.
 | env | effect |
 |---|---|
 | `SAJILO_ROOT` | where the instance lives (default `~/.sajilo`) |
-| `SAJILO_RELAY_PORT` | the relay's port (default 43914) |
+| `SAJILO_RELAY_PORT` | the relay's port (default 43915) |
 | `SAJILO_TUNNEL_PORT` | the tunnel's proxy port (default 40003) |
 | `SAJILO_BIN` | the runtime binary to use (default: the pinned opencode) |
 | `SAJILO_NO_DOWNLOAD` | `1` = never download a runtime, fail instead |
@@ -676,8 +676,8 @@ be pointed at any OpenAI-compatible endpoint:
 
 ```bash
 # any client can use the relay
-curl http://127.0.0.1:43914/v1/models
-OPENAI_BASE_URL=http://127.0.0.1:43914/v1 OPENAI_API_KEY=public my-tool
+curl http://127.0.0.1:43915/v1/models
+OPENAI_BASE_URL=http://127.0.0.1:43915/v1 OPENAI_API_KEY=public my-tool
 ```
 
 ## How it was verified

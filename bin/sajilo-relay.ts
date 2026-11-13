@@ -20,7 +20,7 @@ if (!dir) {
   process.exit(1)
 }
 
-const port = process.env.SAJILO_RELAY_PORT ?? "43914"
+const port = process.env.SAJILO_RELAY_PORT ?? "43915"
 const bind = process.env.SAJILO_RELAY_BIND ?? "127.0.0.1"
 
 const mod = await import(pathToFileURL(join(dir, "sajilo-relay.ts")).href)

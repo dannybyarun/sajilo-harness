@@ -82,7 +82,7 @@ function define<T>(plugin: T): T {
 
 type Ctx = { options?: Record<string, unknown>; [k: string]: unknown }
 
-const PORT = Number(env("RELAY_PORT") ?? 43904)
+const PORT = Number(env("RELAY_PORT") ?? 43915)
 // A build marker. The doctor reads it to tell which relay wrote the log, and
 // judges only what THIS build did - the log also holds the history of
 // earlier builds, and an old rotation must not fail today's check.
@@ -1188,12 +1188,13 @@ async function ensureDirectProxy(): Promise<string | null> {
 async function fetchUpstream(
   target: string,
   init: RequestInit,
-  forceDirect = false,
+  egress: Egress = "proxy",
 ): Promise<Response> {
+  const forceDirect = egress === "direct"
   // A per-instance proxy (the sajilo instance points at its OWN tunnel so a
   // chaos test on it cannot touch the live one). Bun accepts a proxy URL per
   // request, which keeps the two instances fully independent.
-  const proxy = env("RELAY_PROXY")
+  const proxy = proxyForLeg(egress)
   if (proxy && !forceDirect) {
     return fetch(target, { ...init, proxy } as RequestInit)
   }
@@ -1226,12 +1227,41 @@ async function fetchUpstream(
 }
 
 /**
- * The egress ladder for one attempt: the proxied path first, then the
- * device's native egress. When the direct-egress flag is set, the proxy is
- * skipped entirely.
+ * The egress legs, in the order the relay climbs them.
+ *
+ * - "proxy"  : the shared tunnel (the Cloudflare WARP app). Fast to rotate -
+ *              a new exit IP in seconds - but its exit IP is shared with
+ *              everything else on this machine, Hermes included.
+ * - "alt"    : THIS INSTANCE's own tunnel (usque). Its exit IP belongs to
+ *              this instance alone, so it is a bucket nobody else is in.
+ *              Rotating it takes minutes, so it is the second leg, not the
+ *              first.
+ * - "direct" : the device's own IP. The last resort.
+ *
+ * A 429 from one leg says THAT bucket is drained, not that the model is -
+ * which is exactly why the ladder exists.
  */
-function egressLadder(): Array<"proxy" | "direct"> {
-  return directEgressEnabled() ? ["direct"] : ["proxy", "direct"]
+type Egress = "proxy" | "alt" | "direct"
+
+/**
+ * The egress ladder for one attempt: the proxied path first, then the
+ * instance's own tunnel, then the device's native egress. When the
+ * direct-egress flag is set, the proxy is skipped entirely.
+ */
+function egressLadder(): Egress[] {
+  if (directEgressEnabled()) return ["direct"]
+  const legs: Egress[] = ["proxy"]
+  if (env("RELAY_PROXY_ALT")) legs.push("alt")
+  legs.push("direct")
+  return legs
+}
+
+/**
+ * The proxy URL for one leg, or null for the direct leg.
+ */
+function proxyForLeg(egress: Egress): string | null {
+  if (egress === "direct") return null
+  return egress === "alt" ? (env("RELAY_PROXY_ALT") ?? null) : (env("RELAY_PROXY") ?? null)
 }
 
 /**
@@ -1247,7 +1277,7 @@ async function fetchWithLadder(
   let lastError: unknown = null
   for (const egress of egressLadder()) {
     try {
-      return await fetchUpstream(target, init, egress === "direct")
+      return await fetchUpstream(target, init, egress)
     } catch (e) {
       lastError = e
     }
@@ -1632,6 +1662,13 @@ function startServer(): void {
             harness: env("RELAY_HARNESS")?.toLowerCase() === "caller" ? "caller" : "sajilo",
             tools: env("RELAY_TOOLS")?.toLowerCase() === "caller" ? "caller" : "sajilo",
             auth: TOKEN ? "token" : "open",
+            // The egress legs, in the order the relay climbs them. The first
+            // one is shared with the rest of the machine, the second is this
+            // instance's own tunnel (a bucket of its own), the last is the
+            // device's own IP.
+            legs: egressLadder(),
+            proxy: env("RELAY_PROXY") ?? null,
+            proxyAlt: env("RELAY_PROXY_ALT") ?? null,
           })
         }
         // A token, when set, is required on everything but the health probe.
@@ -1947,15 +1984,15 @@ function startServer(): void {
                     // @ts-expect-error bun extension: keep the SSE pipe alive
                     duplex: "half",
                   },
-                  egress === "direct",
+                  egress,
                 )
-                // A 429 from the proxied leg means THAT BUCKET is drained -
-                // not that the model is. The native egress is a different
-                // bucket (its own exit IP) and can still have room, so keep
-                // climbing the ladder instead of answering the 429.
-                if (resp.status === 429 && egress === "proxy" && egressLadder().length > 1) {
+                // A 429 from a proxied leg means THAT BUCKET is drained - not
+                // that the model is. The next leg is a different exit IP (its
+                // own bucket) and can still have room, so keep climbing the
+                // ladder instead of answering the 429.
+                if (resp.status === 429 && egress !== "direct" && egressLadder().length > 1) {
                   logActivity(
-                    `[${new Date().toISOString()}] SPIN 429 via the proxied egress (${wanted}): that bucket is drained - trying the direct egress`,
+                    `[${new Date().toISOString()}] SPIN 429 via the ${egress} egress (${wanted}): that bucket is drained - trying the next egress`,
                   )
                   try {
                     await resp.body?.cancel()
@@ -1969,14 +2006,14 @@ function startServer(): void {
               } catch (e) {
                 finalStatus = 0
                 finalErrBody = String(e).slice(0, 300)
-                if (egress === "proxy") {
-                  // The proxy leg failed - fall through to the direct leg.
+                if (egress !== "direct") {
+                  // This proxy leg failed - fall through to the next leg.
                   logActivity(
-                    `[${new Date().toISOString()}] SPIN fetch-error via proxy (${wanted}): ${finalErrBody} - trying the native egress`,
+                    `[${new Date().toISOString()}] SPIN fetch-error via the ${egress} egress (${wanted}): ${finalErrBody} - trying the next egress`,
                   )
                   continue
                 }
-                // Both legs failed for this attempt.
+                // Every leg failed for this attempt.
                 fetchErrors++
                 if (rotationInProgress()) {
                   logActivity(
@@ -2616,7 +2653,7 @@ export async function startRelay(): Promise<(() => Promise<void>) | undefined> {
 
     // Adopt-or-degrade: another opencode process may already own the port
     // with a healthy relay. Binding again would throw "Failed to start
-    // server. Is port 43904 in use?" and deactivate the plugin in THIS
+    // server. Is port 43915 in use?" and deactivate the plugin in THIS
     // process. The relay is stateless across processes (it re-reads the
     // live-session/live-project pin files on every request), so adopting
     // is lossless: this process just talks to the existing relay as a client.

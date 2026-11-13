@@ -8,7 +8,7 @@
 # It is independent of any opencode you are already running:
 #   * its own HOME        -> its own opencode.db, sessions, config, plugins
 #   * its own project dir -> <root>/work
-#   * its own relay       -> 127.0.0.1:43914 (by default; the live one is 43904)
+#   * its own relay       -> 127.0.0.1:43915 (by default; the live one is 43904)
 #   * its own tunnel      -> optional: a usque/WARP proxy on 127.0.0.1:40003
 #                           with its own identity. Where usque does not exist
 #                           (Windows, macOS) the relay simply uses the device's
@@ -31,8 +31,8 @@ HOME_DIR="$ROOT/home"
 STATE="$ROOT/state"
 WORK="$ROOT/work"
 TUNNEL_DIR="$ROOT/tunnel"
-RELAY_PORT=${SAJILO_RELAY_PORT:-43914}
-TUNNEL_PORT=${SAJILO_TUNNEL_PORT:-40003}
+RELAY_PORT=${SAJILO_RELAY_PORT:-43915}
+TUNNEL_PORT=${SAJILO_TUNNEL_PORT:-40005}
 PLUGIN_DIR="$HOME_DIR/.config/opencode/plugin"
 # The opencode binary is sajilo's runtime. The installer pins the exact one it
 # found (or downloaded) so sajilo always starts the same binary, whatever
@@ -164,6 +164,14 @@ use_tunnel() {
   export HTTPS_PROXY="http://127.0.0.1:$TUNNEL_PORT"
   export HTTP_PROXY="http://127.0.0.1:$TUNNEL_PORT"
   export SAJILO_RELAY_PROXY="http://127.0.0.1:$TUNNEL_PORT"
+  # The SECOND leg of the egress ladder: the Cloudflare WARP app, when it is
+  # up. This instance's own tunnel is the primary (its exit IP - and so its
+  # quota bucket - belongs to this instance alone); the WARP app's exit is
+  # shared with everything else on the machine, so it is the next bucket to
+  # climb to when the private one is drained.
+  if warp_proxy_up; then
+    export SAJILO_RELAY_PROXY_ALT="http://127.0.0.1:40000"
+  fi
   export NO_PROXY="127.0.0.1,localhost,::1"
   export no_proxy="127.0.0.1,localhost,::1"
   return 0
@@ -182,6 +190,8 @@ use_native() {
   if [ -z "${SAJILO_RELAY_PROXY:-}" ] && warp_proxy_up; then
     export SAJILO_RELAY_PROXY="http://127.0.0.1:40000"
   fi
+  # The WARP app is the primary leg here, so there is no second proxy leg.
+  unset SAJILO_RELAY_PROXY_ALT
   export NO_PROXY="127.0.0.1,localhost,::1"
   export no_proxy="127.0.0.1,localhost,::1"
 }

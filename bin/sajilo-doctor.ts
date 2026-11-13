@@ -14,7 +14,7 @@ const ROOT = process.env.SAJILO_ROOT ?? join(process.env.HOME ?? ".", ".sajilo")
 const HOME_DIR = join(ROOT, "home")
 const STATE = join(ROOT, "state")
 const PLUGIN_DIR = join(HOME_DIR, ".config", "opencode", "plugin")
-const PORT = process.env.SAJILO_RELAY_PORT ?? "43914"
+const PORT = process.env.SAJILO_RELAY_PORT ?? "43915"
 const BASE = `http://127.0.0.1:${PORT}`
 
 let failures = 0
@@ -195,7 +195,34 @@ const directProxy =
   process.env.OPENCODE_RELAY_DIRECT_PROXY ??
   relayEnv.SAJILO_RELAY_DIRECT_PROXY ??
   ""
+// The instance's OWN tunnel: the second proxy leg of the egress ladder. Its
+// exit IP belongs to this instance alone, so it is the one bucket on this
+// machine that nobody else is in.
+const altProxy =
+  process.env.SAJILO_RELAY_PROXY_ALT ??
+  process.env.OPENCODE_RELAY_PROXY_ALT ??
+  relayEnv.SAJILO_RELAY_PROXY_ALT ??
+  ""
 const TRACE = "https://www.cloudflare.com/cdn-cgi/trace"
+
+/** The exit IP of one proxy, or nothing if it did not answer. */
+async function exitThrough(
+  proxyUrl: string,
+): Promise<{ ip?: string; warp?: string }> {
+  try {
+    const r = await fetch(TRACE, {
+      proxy: proxyUrl,
+      signal: AbortSignal.timeout(8000),
+    } as RequestInit)
+    const t = await r.text()
+    return {
+      ip: /ip=([^\n\r]+)/.exec(t)?.[1],
+      warp: /warp=(\w+)/.exec(t)?.[1],
+    }
+  } catch {
+    return {}
+  }
+}
 
 // The direct exit: the second bucket. Measured through the direct proxy (an
 // explicit proxy that connects with a raw socket - the opencode-warp stack's
@@ -271,6 +298,30 @@ if (proxy) {
 }
 
 const native = await directExit()
+if (altProxy) {
+  // The private leg: this instance's own tunnel. It is the bucket nobody
+  // else on this machine is in, so it is worth saying plainly that it is
+  // there and that it is a DIFFERENT bucket from the shared one.
+  const alt = await exitThrough(altProxy)
+  if (alt.ip) {
+    if (alt.ip === proxiedIp) {
+      warn(
+        `the instance's own tunnel has the SAME exit as the shared one (${alt.ip}) - ` +
+          `one bucket after all. Rotating the own tunnel is what separates them.`,
+      )
+    } else {
+      ok(
+        `instance's own tunnel: ip=${alt.ip} warp=${alt.warp ?? "?"} (${altProxy}) - ` +
+          `a bucket of this instance's own`,
+      )
+    }
+  } else {
+    warn(
+      `the instance's own tunnel (${altProxy}) did not answer - ` +
+        `the private leg of the ladder is not available`,
+    )
+  }
+}
 if (native.ip) {
   if (proxiedIp && native.ip === proxiedIp) {
     // Same IP on both legs: the tunnel IS the machine's egress (system
@@ -300,13 +351,13 @@ if (native.ip) {
 console.log("\nreset record")
 try {
   const log = readFileSync(join(STATE, "relay-activity.log"), "utf8")
-  const lines = log.split("\n").filter((l) => l.startsWith("["))
+  const lines = log.split("\n").filter((l: string) => l.startsWith("["))
   const last = lines.slice(-400)
-  const ok200 = last.filter((l) => l.includes("UPSTREAM 200")).length
-  const spins = last.filter((l) => l.includes("SPIN 429 on")).length
-  const climbs = last.filter((l) => l.includes("trying the native egress")).length
-  const resets = last.filter((l) => l.includes("RESET kicked")).length
-  const landed = last.filter((l) => l.includes("RESET landed")).length
+  const ok200 = last.filter((l: string) => l.includes("UPSTREAM 200")).length
+  const spins = last.filter((l: string) => l.includes("SPIN 429 on")).length
+  const climbs = last.filter((l: string) => l.includes("trying the next egress")).length
+  const resets = last.filter((l: string) => l.includes("RESET kicked")).length
+  const landed = last.filter((l: string) => l.includes("RESET landed")).length
   const perModel = new Map<string, number>()
   for (const l of last) {
     const m = /SPIN 429 on ([^\s(]+)/.exec(l)
@@ -320,16 +371,18 @@ try {
   } else {
     ok("no model is hitting 429")
   }
-  const lastOk = lines.filter((l) => l.includes("UPSTREAM 200")).pop()
+  const lastOk = lines.filter((l: string) => l.includes("UPSTREAM 200")).pop()
   if (lastOk) ok(`last success: ${lastOk.slice(1, 20).replace("Z", "")}`)
-  const served = lines.filter((l) => l.includes("] SERVED ")).pop()
+  const served = lines.filter((l: string) => l.includes("] SERVED ")).pop()
   if (served) {
     const m = /] SERVED (\S+)(.*)$/.exec(served)
     ok(`last model that answered: ${m?.[1] ?? "?"}${m?.[2]?.trim() ? ` ${m[2].trim()}` : ""}`)
   }
-  // The rule: the caller always gets the model it asked for. A request
-  // answered by a different model means the relay rotated - which it must
-  // not do any more, because a rotation changes the answer, not the quota.
+  // The rule: the caller asked for a model, and a drained window is fixed
+  // with a fresh identity - the model itself is only swapped when the
+  // requested one is spent for the WHOLE account and a fallback is
+  // configured. That swap has to be visible, because the answer then comes
+  // from a different model than the caller asked for.
   //
   // Judge only what the CURRENT build did: the log also holds the history of
   // earlier builds, and an old rotation must not fail today's check. The
@@ -340,9 +393,12 @@ try {
   )
   const since = lastStart >= 0 ? lines.slice(lastStart) : last
   const build = /RELAY-START build=(\S+)/.exec(lines[lastStart] ?? "")?.[1]
-  const rotations = since.filter((l) => l.includes("SPIN fallback used")).length
+  const rotations = since.filter((l: string) => l.includes("falling back to")).length
   if (rotations) {
-    bad(`${rotations} request(s) were answered by a model the caller did not ask for - the relay must reset the limit, never rotate models`)
+    warn(
+      `${rotations} request(s) were answered by a different model than the caller asked for - ` +
+        `the requested model was spent for the whole account and the fallback answered instead`,
+    )
   } else {
     ok(
       `every request was answered by the model it asked for` +

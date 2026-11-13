@@ -23,7 +23,7 @@ jobs:
         run: |
           bunx tsc --noEmit --skipLibCheck --target esnext --module esnext \
             --moduleResolution bundler --lib esnext,dom \
-            plugin/sajilo-relay.ts 2>&1 \
+            plugin/sajilo-relay.ts bin/sajilo-relay.ts bin/sajilo-doctor.ts 2>&1 \
             | grep -vE "TS2591|TS2868|TS2307|Cannot find name 'process'|Cannot find name 'Bun'|Cannot find type definition|Entry point of type library|If you have issues related to imports|The file is in the program because" \
             | tee /tmp/tsc.txt
           test ! -s /tmp/tsc.txt
