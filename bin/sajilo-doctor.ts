@@ -119,22 +119,87 @@ try {
 // The free allowance is keyed on the exit IP, so the egress matters: a second
 // egress is a second bucket.
 console.log("\negress")
-const proxy = process.env.SAJILO_RELAY_PROXY ?? ""
-if (proxy) {
-  ok(`proxied leg: ${proxy} - a drained bucket can be climbed over`)
+// The relay's proxied leg is whatever proxy it will ACTUALLY use: the
+// explicit SAJILO_RELAY_PROXY, else the ambient HTTPS_PROXY/HTTP_PROXY that
+// Bun's fetch honours. Checking only the env var used to say "no proxied
+// leg" on a machine whose ambient proxy WAS the Cloudflare WARP proxy
+// (warp-svc.exe on 127.0.0.1:40000) - and that answer decides whether the
+// instance has one bucket or two.
+const explicitProxy =
+  process.env.SAJILO_RELAY_PROXY ?? process.env.OPENCODE_RELAY_PROXY ?? ""
+const ambientProxy =
+  process.env.HTTPS_PROXY ??
+  process.env.https_proxy ??
+  process.env.HTTP_PROXY ??
+  process.env.http_proxy ??
+  ""
+const proxy = explicitProxy || ambientProxy
+const TRACE = "https://www.cloudflare.com/cdn-cgi/trace"
+
+// The native exit: the second bucket. Measured with the proxy bypassed,
+// exactly like the relay's own "direct" leg (Bun only bypasses the proxy
+// through NO_PROXY).
+async function nativeExit(): Promise<{ ip?: string; warp?: string }> {
+  const savedNO = process.env.NO_PROXY
+  const savedno = process.env.no_proxy
+  const host = new URL(TRACE).hostname
+  const next = `${savedNO ?? ""},${host}`.replace(/^,/, "")
+  process.env.NO_PROXY = next
+  process.env.no_proxy = next
   try {
-    const r = await fetch("https://www.cloudflare.com/cdn-cgi/trace", {
+    const r = await fetch(TRACE, { signal: AbortSignal.timeout(8000) })
+    const t = await r.text()
+    return { ip: /ip=([^\n\r]+)/.exec(t)?.[1], warp: /warp=(\w+)/.exec(t)?.[1] }
+  } catch {
+    return {}
+  } finally {
+    if (savedNO === undefined) delete process.env.NO_PROXY
+    else process.env.NO_PROXY = savedNO
+    if (savedno === undefined) delete process.env.no_proxy
+    else process.env.no_proxy = savedno
+  }
+}
+
+let proxiedIp = ""
+if (proxy) {
+  ok(
+    `proxied leg: ${proxy}` +
+      `${explicitProxy ? " (SAJILO_RELAY_PROXY)" : " (the ambient proxy the relay inherits)"}` +
+      ` - a drained bucket can be climbed over`,
+  )
+  try {
+    // Through the proxy explicitly: Bun's fetch would only pick the ambient
+    // one up on its own, and the IP printed must be the PROXIED exit.
+    const r = await fetch(TRACE, {
+      proxy,
       signal: AbortSignal.timeout(8000),
-    })
+    } as RequestInit)
     const t = await r.text()
     const warp = /warp=(\w+)/.exec(t)?.[1]
     const ip = /ip=([^\n\r]+)/.exec(t)?.[1]
+    proxiedIp = ip ?? ""
     ok(`exit through the proxy: ip=${ip ?? "?"} warp=${warp ?? "?"}`)
   } catch (e) {
     warn(`the proxy is set but did not answer: ${e}`)
   }
 } else {
   warn("no proxied leg - only one exit IP, so one bucket")
+}
+
+const native = await nativeExit()
+if (native.ip) {
+  if (proxiedIp && native.ip === proxiedIp) {
+    // Same IP on both legs: the tunnel IS the machine's egress (system
+    // proxy / TUN), so bypassing the proxy changes nothing. One bucket -
+    // and the only way to a new one is to rotate the registration.
+    warn(
+      `the native exit is the SAME ip as the proxied one (${native.ip}, warp=${native.warp ?? "?"}) - ` +
+        `the tunnel is this machine's system egress, so both legs are ONE bucket. ` +
+        `A new bucket comes from rotating the registration (warp-rotate), not from the ladder.`,
+    )
+  } else {
+    ok(`native exit: ip=${native.ip} warp=${native.warp ?? "off"} - a second bucket`)
+  }
 }
 
 // --- the reset record --------------------------------------------------------
@@ -178,7 +243,7 @@ try {
   // earlier builds, and an old rotation must not fail today's check. The
   // relay writes a RELAY-START marker when it comes up.
   const lastStart = lines.reduce(
-    (acc, l, i) => (l.includes("RELAY-START") ? i : acc),
+    (acc: number, l: string, i: number) => (l.includes("RELAY-START") ? i : acc),
     -1,
   )
   const since = lastStart >= 0 ? lines.slice(lastStart) : last

@@ -506,15 +506,37 @@ canary: if it ever fails, something rotated a model again.
 | separate HOME, DB, sessions, project | yes | yes |
 | own relay (port 43914) with ladder/budget/reset | yes | yes |
 | own **rotatable** WARP tunnel (usque) | yes (if `usque` is present) | yes (the opencode-warp stack) |
-| egress recovery by rotating the IP | yes | native egress only (a second bucket can be added by pointing `SAJILO_RELAY_PROXY` at any local HTTP proxy) |
+| egress recovery by rotating the IP | yes | yes - `warp-rotate.cmd` gives a new exit IP, which is a new bucket |
 | the live opencode is unaffected | yes | yes |
 
-Where `usque` is not available the relay simply uses the machine's native
-egress - still a completely separate instance, it just has no *rotatable*
-second bucket. To give it one, point it at any local HTTP proxy:
+On Windows the tunnel is **Cloudflare WARP** (`warp-svc.exe`, a local proxy on
+`127.0.0.1:40000`). The relay's proxied leg is whatever proxy it actually
+uses - `SAJILO_RELAY_PROXY`, else the ambient `HTTPS_PROXY` that Bun's fetch
+honours - and the native egress is the second leg. `sajilo doctor` prints both
+exit IPs and says plainly whether they are really two buckets:
+
+```
+egress
+  ok    proxied leg: http://127.0.0.1:40000 (the ambient proxy the relay inherits) - a drained bucket can be climbed over
+  ok    exit through the proxy: ip=2a09:bac5:4e7b:11c3::1c5:132 warp=on
+  warn  the native exit is the SAME ip as the proxied one (...warp=on) - the tunnel is this machine's system egress, so both legs are ONE bucket. A new bucket comes from rotating the registration (warp-rotate), not from the ladder.
+```
+
+When WARP is the machine's *system* egress - which is the case here - both
+legs land on the same address, so the ladder cannot climb to a second bucket:
+bypassing the proxy changes nothing. A new bucket comes from **rotating the
+registration**, which is what the reset does.
+
+A headless client needs nothing special. The relay runs on its own, without
+the TUI:
 
 ```bash
-SAJILO_TUNNEL_PORT=8080 SAJILO_RELAY_PROXY=http://127.0.0.1:8080 sajilo
+sajilo relay                       # the provider, headless
+bun run <root>/bin/sajilo-relay.ts # the same thing, directly
+```
+
+```bash
+OPENAI_BASE_URL=http://127.0.0.1:43914/v1 OPENAI_API_KEY=public my-client
 ```
 
 ## Layout
