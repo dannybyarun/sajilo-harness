@@ -108,24 +108,33 @@ set "HTTP_PROXY="
 REM The tunnel leg of the egress ladder, and the rotator that gives it a new
 REM exit IP (a new quota bucket).
 REM
-REM usque is preferred: it is a user-space WARP client (one binary, one
-REM config file), so installing AND rotating it needs no administrator
-REM rights and no UAC prompt. The Cloudflare WARP app is the alternative
-REM (its proxy is on 127.0.0.1:40000), but it is a service - registering it
-REM again needs admin, so it is only used when it is already there.
-if exist "%ROOT%\bin\usque.exe" (
-  if not exist "%ROOT%\tunnel" mkdir "%ROOT%\tunnel" >nul 2>&1
-  netstat -ano | findstr /R /C:"127.0.0.1:%SAJILO_TUNNEL_PORT% .*LISTENING" >nul 2>&1
-  if errorlevel 1 (
-    set "HTTPS_PROXY="
-    set "HTTP_PROXY="
-    start "" /b "%ROOT%\bin\usque.exe" -c "%ROOT%\tunnel\config.json" http-proxy -b 127.0.0.1 -p %SAJILO_TUNNEL_PORT% >>"%STATE%\usque.log" 2>>"%STATE%\usque.log.err"
-  )
-  set "SAJILO_RELAY_PROXY=http://127.0.0.1:%SAJILO_TUNNEL_PORT%"
-  set "SAJILO_RELAY_ROTATOR=%ROOT%\bin\usque-rotate.cmd"
-) else (
+REM The Cloudflare WARP APP is the primary: it was working before usque
+REM existed, and its rotation is fast (measured: 6.8 s). usque is the
+REM admin-free fallback for a machine that has no WARP app - it is a
+REM user-space client, so installing AND rotating it needs no service and no
+REM UAC, but its rotation takes longer.
+if "%SAJILO_RELAY_PROXY%"=="" (
   netstat -ano | findstr /R /C:"127.0.0.1:40000 .*LISTENING" >nul 2>&1
   if not errorlevel 1 set "SAJILO_RELAY_PROXY=http://127.0.0.1:40000"
+)
+if "%SAJILO_RELAY_PROXY%"=="" (
+  if exist "%ROOT%\bin\usque.exe" (
+    if not exist "%ROOT%\tunnel" mkdir "%ROOT%\tunnel" >nul 2>&1
+    netstat -ano | findstr /R /C:"127.0.0.1:%SAJILO_TUNNEL_PORT% .*LISTENING" >nul 2>&1
+    if errorlevel 1 (
+      set "HTTPS_PROXY="
+      set "HTTP_PROXY="
+      start "" /b "%ROOT%\bin\usque.exe" -c "%ROOT%\tunnel\config.json" http-proxy -b 127.0.0.1 -p %SAJILO_TUNNEL_PORT% >>"%STATE%\usque.log" 2>>"%STATE%\usque.log.err"
+    )
+    set "SAJILO_RELAY_PROXY=http://127.0.0.1:%SAJILO_TUNNEL_PORT%"
+  )
+)
+REM The rotator that gives the tunnel a new identity. The WARP app's own
+REM rotation comes first (fast); the instance's usque rotator is the
+REM admin-free alternative.
+if "%SAJILO_RELAY_ROTATOR%"=="" (
+  if exist "%LOCALAPPDATA%\opencode-warp\bin\warp-rotate.cmd" set "SAJILO_RELAY_ROTATOR=%LOCALAPPDATA%\opencode-warp\bin\warp-rotate.cmd"
+  if exist "%ROOT%\bin\usque-rotate.cmd" set "SAJILO_RELAY_ROTATOR=%ROOT%\bin\usque-rotate.cmd"
 )
 REM The SECOND leg of the egress ladder: the device's OWN exit, not the
 REM tunnel's. The shim (egress-proxy.py --upstream direct) connects with a

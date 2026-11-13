@@ -551,40 +551,34 @@ canary: if it ever fails, something rotated a model again.
 | egress recovery by rotating the IP | yes | yes - `usque-rotate.cmd` gives a new exit IP, no admin |
 | the live opencode is unaffected | yes | yes |
 
-On Windows the tunnel is **Cloudflare WARP** (`warp-svc.exe`, in proxy mode on
-`127.0.0.1:40000`). The relay's proxied leg is whatever proxy it actually
-uses - `SAJILO_RELAY_PROXY`, else the ambient `HTTPS_PROXY` that Bun's fetch
-honours - and the **direct leg** is the device's own route.
+On Windows the tunnel is **Cloudflare WARP**. The **WARP app** is the primary
+(`warp-svc.exe` in proxy mode on `127.0.0.1:40000`, and its own rotation
+takes ~7 s). `usque` is the **admin-free fallback** for a machine with no WARP
+app: it is a user-space MASQUE client, so installing *and* rotating it needs
+no service and no UAC.
 
-Bun below 1.4 ignores `NO_PROXY` entirely (measured: `NO_PROXY=host`,
-`NO_PROXY=*`, `NO_PROXY=.host` and `proxy:''` all tunnelled), so the direct
-leg cannot simply bypass the proxy - both legs would come out of the same
-exit IP and the ladder would have nothing to climb. It takes an explicit
-proxy that connects **directly** instead:
-
-```bash
-SAJILO_RELAY_DIRECT_PROXY=http://127.0.0.1:40001
-```
-
-The relay starts that proxy itself: the opencode-warp stack's
-`egress-proxy.py --upstream direct`, which opens a raw socket (no proxy in
-between). Because the shim only tunnels the bytes, the TLS fingerprint is
-still Bun's - which the gateway's whitelist requires.
+The relay's tunnel leg is whatever proxy it actually uses - `SAJILO_RELAY_PROXY`,
+else the ambient `HTTPS_PROXY` that Bun's fetch honours - and the **direct
+leg** is the device's own route, reached through the stack's
+`egress-proxy.py --upstream direct` (a raw socket, so it leaves the tunnel).
+Because the shim only tunnels the bytes, the TLS fingerprint is still Bun's -
+which the gateway's whitelist requires.
 
 Measured on this machine:
 
-| leg | exit | |
+| leg | exit | to the gateway |
 |---|---|---|
-| the tunnel (`40000`) | `2a09:bac5:4e7d:16b4::243:85` | `warp=on` |
-| the direct shim (`40001`) | `2400:1a00:4b26:e77b:19f1:ef89:72ee:8d38` | `warp=off` - the ISP |
+| the WARP app (`40000`) | `2a09:bac5:4e79:16aa::242:6b` | 0.42 s |
+| usque (`40003`) | `2a09:bac5:4e7d:1a8c::2a5:6e` | 0.43 s |
+| the direct shim (`40001`) | `2400:1a00:4b26:e77b:19f1:ef89:72ee:8d38` (`warp=off` - the ISP) | 0.38 s |
 
-Two exits, two quota buckets. `sajilo doctor` prints both and says plainly
-whether they are really two:
+Three exits, three quota buckets. `sajilo doctor` prints them and says
+plainly whether they are really three:
 
 ```
 egress
-  ok    proxied leg: http://127.0.0.1:40000 (the ambient proxy the relay inherits) - a drained bucket can be climbed over
-  ok    exit through the proxy: ip=2a09:bac5:4e7d:16b4::243:85 warp=on
+  ok    proxied leg: http://127.0.0.1:40000 (SAJILO_RELAY_PROXY) - a drained bucket can be climbed over
+  ok    exit through the proxy: ip=2a09:bac5:4e79:16aa::242:6b warp=on
   ok    direct exit: ip=2400:1a00:4b26:e77b:19f1:ef89:72ee:8d38 warp=off - a second bucket (via http://127.0.0.1:40001)
 ```
 
@@ -628,6 +622,7 @@ file.
 | `SAJILO_FORCE_DOWNLOAD` | `1` = ignore the installed runtime, fetch a private one into the instance |
 | `SAJILO_RELAY_PROXY` | the proxy for the tunnel leg of the egress ladder (default: the ambient `HTTPS_PROXY`) |
 | `SAJILO_RELAY_DIRECT_PROXY` | an explicit proxy for the direct leg - one that connects directly (the opencode-warp stack's `egress-proxy.py --upstream direct`). The relay starts it if it is not running. Without it the direct leg stays in the tunnel on Bun < 1.4, because `NO_PROXY` is ignored there |
+| `SAJILO_RELAY_FALLBACK_MODEL` | `auto`, or a comma-separated list: when the requested model is spent for the whole account, another free model answers instead of stalling until the window rolls over. Off by default - the requested model is always tried first, and the response says which model served (`x-sajilo-model`) |
 | `SAJILO_RELAY_KEEP_WORKING_MS` | how long the relay keeps working on one request - waiting out refills, resetting the identity, rotating the egress - before it answers a retryable 503 (default 240000; Bun's idle cap is 255 s, so a longer hold would have its socket cut) |
 | `SAJILO_RELAY_MAX_RESETS` | a safety valve on the resets per request; `0` = unlimited, the ceiling above is the only limit (default 0) |
 | `SAJILO_RELAY_WAIT_MAX_SECONDS` | the longest refill the relay waits out instead of resetting the identity (default 45) |

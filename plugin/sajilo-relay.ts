@@ -703,12 +703,16 @@ async function performEgressRotation(reason: string): Promise<boolean> {
   // tunnel. A hardcoded path meant sajilo's rescue chain rotated the LIVE
   // tunnel.
   //
-  // Windows has its own rotator: the instance's usque-rotate.cmd (usque is a
-  // user-space WARP client, so rotating it needs no administrator rights).
-  // The opencode-warp stack's warp-rotate.cmd is the fallback.
+  // The Cloudflare WARP app's rotator comes first - it was working before
+  // usque existed, and it is fast (measured: 6.8 s). The instance's own
+  // usque rotator is the admin-free alternative (no service, no UAC).
   const isWindows = process.platform === "win32"
   const ROTATOR = isWindows
-    ? (env("RELAY_ROTATOR") ?? instanceUsqueRotator() ?? `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`)
+    ? (env("RELAY_ROTATOR") ??
+      (existsSync(`${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`)
+        ? `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`
+        : instanceUsqueRotator()) ??
+      `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`)
     : (env("RELAY_ROTATOR") ?? "/usr/local/lib/opencode-warp/warp-rotate.sh")
   const RESCUE_LOG = env("RELAY_RESCUE_LOG") ?? "/tmp/sajilo/rescue.log"
   const transcript = (line: string) => {
@@ -906,6 +910,30 @@ function startReset(reason: string): Promise<ResetResult> {
 }
 
 /**
+ * The models that may answer when the requested one is spent for the whole
+ * account.
+ *
+ * Off by default: the requested model is always preferred, and only the
+ * reset can change the identity. But when the gateway says the model's
+ * allowance refills in HOURS, no rotation helps - the session simply stalls
+ * until the window rolls over. Set SAJILO_RELAY_FALLBACK_MODEL=auto (or a
+ * comma-separated list) to let another free model answer instead: the
+ * response says which model served (x-sajilo-model), and the harness prompt
+ * is filled with that model too.
+ */
+function fallbackModels(current: string): string[] {
+  const cfg = (env("RELAY_FALLBACK_MODEL") ?? "").trim()
+  if (!cfg) return []
+  if (cfg.toLowerCase() === "auto") {
+    return FREE_POOL_FALLBACK.filter((m) => m !== current)
+  }
+  return cfg
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s && s !== current)
+}
+
+/**
  * Is this 429 a drained quota, or a rejected request shape? They look the
  * same from the outside (the doctor tells them apart), but they need
  * opposite cures: a drained window is fixed by a reset, a rejected shape is
@@ -999,14 +1027,15 @@ function withHost(list: string, host: string): string {
 // The relay starts that shim itself if the stack and python are here.
 let directProxyStarted = false
 
-/** The stack's bin directory - the rotator lives next to the shim. */
+/** The stack's bin directory - where the egress shim lives. */
 function stackDir(): string {
-  const rotator =
-    env("RELAY_ROTATOR") ??
-    (process.platform === "win32"
-      ? `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`
-      : "/usr/local/lib/opencode-warp/warp-rotate.sh")
-  return rotator.replace(/[/\\][^/\\]*$/, "")
+  // NOT derived from the ROTATOR: the rotator may point at the instance's
+  // own usque rotator (<root>/bin/usque-rotate.cmd), and looking for the
+  // shim THERE finds nothing - so the direct leg silently fell back to the
+  // tunnel and the "second bucket" did not exist.
+  return process.platform === "win32"
+    ? `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin`
+    : "/usr/local/lib/opencode-warp"
 }
 
 /** Is something listening on this host:port? */
@@ -1764,8 +1793,12 @@ function startServer(): void {
           // The model the caller asked for. It NEVER changes: a 429 is a
           // drained window, not a bad model, so the answer is a reset of the
           // identity, not a different model.
-          const wanted = originModel
+          // (Unless a fallback is configured - see fallbackModels - and even
+          // then the requested model is always tried first.)
+          let wanted = originModel
           requestedModel = wanted
+          const fallbacks = fallbackModels(wanted)
+          let fallbackIndex = -1
           // How long the relay is willing to keep working on ONE request.
           //
           // The old spin gave up after 45 s and handed the caller the
@@ -1970,6 +2003,21 @@ function startServer(): void {
                     `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window refills in ${refillIn}s - waiting it out`,
                   )
                   await Bun.sleep(waitMs)
+                  continue
+                }
+                // The requested model is spent for the whole account. If a
+                // fallback is configured, another free model answers instead
+                // of stalling the session until the window rolls over.
+                if (fallbackIndex + 1 < fallbacks.length) {
+                  fallbackIndex++
+                  wanted = fallbacks[fallbackIndex]
+                  requestedModel = wanted
+                  // The new model gets its own reset cycle.
+                  egressRotated = false
+                  mintSettled = false
+                  logActivity(
+                    `[${new Date().toISOString()}] SPIN 429 on ${originModel}: the model is spent for the whole account - falling back to ${wanted}`,
+                  )
                   continue
                 }
                 logActivity(

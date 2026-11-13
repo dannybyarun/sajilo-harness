@@ -272,30 +272,32 @@ if ($env:SAJILO_SKIP_TUNNEL -eq "1") {
   Say "tunnel skipped (SAJILO_SKIP_TUNNEL=1) - the relay will use the machine's own egress"
   "skipped by SAJILO_SKIP_TUNNEL=1" | Set-Content (Join-Path $StateDir "tunnel.txt")
 } else {
-  # usque is the tunnel the instance uses: it installs AND rotates without
-  # administrator rights. The Cloudflare WARP app is only the fallback,
-  # because re-registering it is a service operation (admin).
-  $haveUsque = Test-Path $UsqueBin
-  if ($haveUsque -and -not (Test-TcpPort ([int]$UsquePort))) {
-    Note "tunnel: usque is installed but not running - starting it"
-    if (-not (Start-Usque)) { $haveUsque = $false }
-  }
-  if (-not $haveUsque) {
-    Note "tunnel: installing usque (a user-space WARP client - no administrator rights, no UAC)"
-    if ((Install-Usque) -and (Register-Usque) -and (Start-Usque)) {
-      $haveUsque = $true
-    }
-  }
-  if ($haveUsque) {
-    Say "tunnel: usque on http://127.0.0.1:$UsquePort - a rotation is a new exit IP, no admin needed"
-    "usque: http://127.0.0.1:$UsquePort" | Set-Content (Join-Path $StateDir "tunnel.txt")
+  # The Cloudflare WARP APP is the primary: where it is installed and
+  # running, it is the tunnel - its rotation is fast (measured: 6.8 s) and it
+  # was working before usque existed.
+  $stackBin = Join-Path $env:LOCALAPPDATA "opencode-warp\bin"
+  $warpApp = (Test-Path (Join-Path $stackBin "warp-rotate.cmd")) -and (Test-TcpPort 40000)
+  if ($warpApp) {
+    Say "tunnel: the Cloudflare WARP app is running (127.0.0.1:40000) - a rotation is a new exit IP"
+    "warp-app: http://127.0.0.1:40000" | Set-Content (Join-Path $StateDir "tunnel.txt")
   } else {
-    # Fall back to the WARP app if it is already there: its proxy is a usable
-    # tunnel even if rotating it needs admin.
-    $stackBin = Join-Path $env:LOCALAPPDATA "opencode-warp\bin"
-    if ((Test-Path (Join-Path $stackBin "warp-rotate.cmd")) -and (Test-TcpPort 40000)) {
-      Say "tunnel: the Cloudflare WARP app's proxy on http://127.0.0.1:40000 (rotating it needs administrator rights)"
-      "warp-stack: http://127.0.0.1:40000" | Set-Content (Join-Path $StateDir "tunnel.txt")
+    # No WARP app: bring usque, the user-space WARP client. Installing AND
+    # rotating it needs no administrator rights, no service and no UAC - it
+    # is the fallback that makes the tunnel work everywhere.
+    $haveUsque = Test-Path $UsqueBin
+    if ($haveUsque -and -not (Test-TcpPort ([int]$UsquePort))) {
+      Note "tunnel: usque is installed but not running - starting it"
+      if (-not (Start-Usque)) { $haveUsque = $false }
+    }
+    if (-not $haveUsque) {
+      Note "tunnel: installing usque (a user-space WARP client - no administrator rights, no UAC)"
+      if ((Install-Usque) -and (Register-Usque) -and (Start-Usque)) {
+        $haveUsque = $true
+      }
+    }
+    if ($haveUsque) {
+      Say "tunnel: usque on http://127.0.0.1:$UsquePort - a rotation is a new exit IP, no admin needed"
+      "usque: http://127.0.0.1:$UsquePort" | Set-Content (Join-Path $StateDir "tunnel.txt")
     } else {
       Say "tunnel: not available - the relay resets the identity instead (one bucket, not two)"
       "unavailable" | Set-Content (Join-Path $StateDir "tunnel.txt")
