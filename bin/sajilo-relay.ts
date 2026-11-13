@@ -24,7 +24,16 @@ const port = process.env.SAJILO_RELAY_PORT ?? "43914"
 const bind = process.env.SAJILO_RELAY_BIND ?? "127.0.0.1"
 
 const mod = await import(pathToFileURL(join(dir, "sajilo-relay.ts")).href)
-mod.startRelay()
+const cleanup = await mod.startRelay()
+if (cleanup) {
+  // A clean stop: release the port instead of letting the process be killed
+  // with the socket still open.
+  const stop = () => {
+    void cleanup().finally(() => process.exit(0))
+  }
+  process.on("SIGINT", stop)
+  process.on("SIGTERM", stop)
+}
 
 console.log(`sajilo relay listening on http://${bind}:${port}`)
 console.log(`  models    : http://${bind}:${port}/v1/models`)

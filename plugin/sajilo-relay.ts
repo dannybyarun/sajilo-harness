@@ -1361,7 +1361,7 @@ async function mintOnce(prompt?: string, force = false): Promise<Record<string, 
     const env: Record<string, string> = {}
     for (const [k, v] of Object.entries(process.env)) {
       if (k === "OPENCODE_SESSION_ID" || v === undefined) continue
-      env[k] = v
+      env[k] = v as string
     }
     // The minted child must NOT run a relay of its own. It loads the same
     // plugin, finds the port already served, and adopts it as a stand-by -
@@ -1505,6 +1505,21 @@ let takeoverTimer: ReturnType<typeof setInterval> | null = null
 let watchdogTimer: ReturnType<typeof setInterval> | null = null
 
 /**
+ * A timer handle is a number under the DOM lib and a Timeout object under
+ * Bun/Node. The only thing we want from it is the optional unref - so the
+ * timer does not keep the process alive - so it goes through this one helper
+ * instead of reaching for a method that only exists on one of the two.
+ */
+function unrefTimer(handle: unknown): void {
+  const h = handle as { unref?: () => void } | null
+  try {
+    h?.unref?.()
+  } catch {
+    /* not a node-style handle - there is nothing to unref */
+  }
+}
+
+/**
  * Stand-by takeover. This process adopted the port because another opencode
  * process owned it. If that owner goes away - its plugin is reloaded, its
  * session ends - nobody would be serving the relay any more, because the
@@ -1532,7 +1547,7 @@ function startTakeover(): void {
       /* the port is still busy - try again on the next tick */
     }
   }, 750)
-  takeoverTimer.unref?.()
+  unrefTimer(takeoverTimer)
 }
 
 let server: ReturnType<typeof Bun.serve> | null = null
@@ -1889,7 +1904,6 @@ function startServer(): void {
                   {
                     method: "POST",
                     headers: buildHeaders(),
-                    // @ts-expect-error bun fetch allows string body
                     body: attemptBody,
                     // @ts-expect-error bun extension: keep the SSE pipe alive
                     duplex: "half",
@@ -2205,11 +2219,22 @@ function startServer(): void {
               // The gateway told us when the window refills. Hand that to the
               // caller as its Retry-After, so the retry lands exactly when
               // the quota is back instead of hammering the gate.
-              const retryIn = lastRefillIn > 0 ? Math.min(lastRefillIn, 3600) : 5
+              //
+              // BUT: if our own reset is still in flight - the egress
+              // rotating, or the identity being minted - the window may open
+              // in seconds, long before the gateway's advertised refill time.
+              // Telling the caller to wait for the gateway's clock would idle
+              // it through a reset that has already landed. So while a reset
+              // is pending, ask for a short retry instead; once both legs are
+              // done and it still does not work, the window really is empty
+              // and the gateway's own time is the right answer.
+              const resetPending = resetInFlight !== null
+              const refill = lastRefillIn > 0 ? Math.min(lastRefillIn, 3600) : 5
+              const retryIn = resetPending ? Math.min(refill, 30) : refill
               headers.set("retry-after", String(retryIn))
               if (requestedModel) headers.set("x-sajilo-model", requestedModel)
               logActivity(
-                `[${new Date().toISOString()}] ANSWER 503 (the 429 is not passed on: the limit is being reset, and the caller is asked to retry in ${retryIn}s)`,
+                `[${new Date().toISOString()}] ANSWER 503 (the 429 is not passed on: the limit is being reset${resetPending ? " and a reset is still in flight" : ""}, and the caller is asked to retry in ${retryIn}s)`,
               )
               return new Response(
                 JSON.stringify({
@@ -2264,7 +2289,7 @@ function startServer(): void {
           let toolCalls: Array<Record<string, unknown>> | undefined
           let reasoning: string | undefined
           let usage: unknown
-          let lastObj: { model?: string; created?: number; id?: string } = {}
+          let lastObj: { model?: string; created?: number; id?: string; [k: string]: any } = {}
           for (const ch of chunks) {
             if (ch.usage) usage = ch.usage
             if (ch.id) lastObj = ch
@@ -2452,7 +2477,79 @@ function readModelPin(): string {
   return DEFAULT_MODEL
 }
 
-export async function startRelay(): Promise<void> {
+// Proactive tunnel watchdog: probe the WARP egress every few minutes and
+// repair it from a cold start if it is down - independent of traffic, so
+// "start at any point works automatically". Cheap when healthy (probe
+// pass = no-op). The cooldown lives inside the script. Disable with
+// SAJILO_RELAY_WATCHDOG=0.
+//
+// It is started from EVERY path (bind, adopt, takeover) on purpose: the
+// instance that takes the port over after a server restart must also keep
+// watching the tunnel, otherwise the tunnel silently stops being repaired
+// after the first restart.
+function startWatchdog(): void {
+  if (watchdogTimer) return
+  if (env("RELAY_WATCHDOG") === "0") return
+  // The watchdog keeps the egress alive. On unix that is the usque tunnel
+  // watchdog; on Windows the opencode-warp stack ships probe.cmd, which checks
+  // the WARP egress the same way. Pointing it at the unix path here meant the
+  // spawn failed every three minutes and filled the log with noise.
+  const isWindows = process.platform === "win32"
+  const WATCHDOG = isWindows
+    ? (env("RELAY_WATCHDOG") ??
+      `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\probe.cmd`)
+    : (env("RELAY_WATCHDOG") ?? "/usr/local/lib/opencode-warp/tunnel-watchdog.sh")
+  if (!existsSync(WATCHDOG)) {
+    logActivity(
+      `[${new Date().toISOString()}] WATCHDOG not present (${WATCHDOG}) - the egress is not being watched`,
+    )
+    return
+  }
+  let watchdogBusy = false
+  const watchdogTick = () => {
+    if (watchdogBusy) return
+    watchdogBusy = true
+    try {
+      const proc = isWindows
+        ? Bun.spawn(["cmd.exe", "/c", WATCHDOG], {
+            stdout: "ignore",
+            stderr: "ignore",
+            stdin: "ignore",
+          })
+        : Bun.spawn(["bash", WATCHDOG], {
+            stdout: "ignore",
+            stderr: "ignore",
+            stdin: "ignore",
+          })
+      proc.unref()
+      proc.exited
+        .then((rc: number) => {
+          if (rc !== 0) {
+            logActivity(`[${new Date().toISOString()}] WATCHDOG repair attempted rc=${rc}`)
+          }
+        })
+        .catch(() => {})
+    } catch (e) {
+      logActivity(`[${new Date().toISOString()}] WATCHDOG spawn failed: ${String(e).slice(0, 200)}`)
+    }
+    watchdogBusy = false
+  }
+  // First tick after a grace period (serve startup can be noisy), then
+  // every 3 minutes for the life of the server.
+  void Bun.sleep(90_000).then(watchdogTick)
+  watchdogTimer = setInterval(watchdogTick, 3 * 60_000)
+  unrefTimer(watchdogTimer)
+}
+
+/**
+ * Start the relay. Callable from the opencode runtime (as the plugin below)
+ * live without a TUI.
+ *
+ * Returns the cleanup the caller must run when it is done: it stops the
+ * server and clears the takeover timer. The caller is the plugin's setup()
+ * (the runtime calls what setup returns on unload) or the standalone runner.
+ */
+export async function startRelay(): Promise<(() => Promise<void>) | undefined> {
   {
     // Every instance writes this, whether it binds or adopts the port: the
     // doctor uses the last marker as the start of the window it judges.
@@ -2581,69 +2678,6 @@ export async function startRelay(): Promise<void> {
       )
     }
 
-// Proactive tunnel watchdog: probe the WARP egress every few minutes and
-// repair it from a cold start if it is down - independent of traffic, so
-// "start at any point works automatically". Cheap when healthy (probe
-// pass = no-op). The cooldown lives inside the script. Disable with
-// SAJILO_RELAY_WATCHDOG=0.
-//
-// It is started from EVERY path (bind, adopt, takeover) on purpose: the
-// instance that takes the port over after a server restart must also keep
-// watching the tunnel, otherwise the tunnel silently stops being repaired
-// after the first restart.
-function startWatchdog(): void {
-  if (watchdogTimer) return
-  if (env("RELAY_WATCHDOG") === "0") return
-  // The watchdog keeps the egress alive. On unix that is the usque tunnel
-  // watchdog; on Windows the opencode-warp stack ships probe.cmd, which checks
-  // the WARP egress the same way. Pointing it at the unix path here meant the
-  // spawn failed every three minutes and filled the log with noise.
-  const isWindows = process.platform === "win32"
-  const WATCHDOG = isWindows
-    ? (env("RELAY_WATCHDOG") ??
-      `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\probe.cmd`)
-    : (env("RELAY_WATCHDOG") ?? "/usr/local/lib/opencode-warp/tunnel-watchdog.sh")
-  if (!existsSync(WATCHDOG)) {
-    logActivity(
-      `[${new Date().toISOString()}] WATCHDOG not present (${WATCHDOG}) - the egress is not being watched`,
-    )
-    return
-  }
-  let watchdogBusy = false
-  const watchdogTick = () => {
-    if (watchdogBusy) return
-    watchdogBusy = true
-    try {
-      const proc = isWindows
-        ? Bun.spawn(["cmd.exe", "/c", WATCHDOG], {
-            stdout: "ignore",
-            stderr: "ignore",
-            stdin: "ignore",
-          })
-        : Bun.spawn(["bash", WATCHDOG], {
-            stdout: "ignore",
-            stderr: "ignore",
-            stdin: "ignore",
-          })
-      proc.unref()
-      proc.exited
-        .then((rc) => {
-          if (rc !== 0) {
-            logActivity(`[${new Date().toISOString()}] WATCHDOG repair attempted rc=${rc}`)
-          }
-        })
-        .catch(() => {})
-    } catch (e) {
-      logActivity(`[${new Date().toISOString()}] WATCHDOG spawn failed: ${String(e).slice(0, 200)}`)
-    }
-    watchdogBusy = false
-  }
-  // First tick after a grace period (serve startup can be noisy), then
-  // every 3 minutes for the life of the server.
-  void Bun.sleep(90_000).then(watchdogTick)
-  watchdogTimer = setInterval(watchdogTick, 3 * 60_000)
-  watchdogTimer.unref?.()
-}
 
     return async () => {
       try {
@@ -2664,6 +2698,9 @@ function startWatchdog(): void {
 export default define({
   id: "local.sajilo-relay",
   async setup(_ctx: Ctx) {
-    await startRelay()
+    // Hand the cleanup back: the runtime calls whatever setup() returns when
+    // the plugin is unloaded, and without it the old build keeps holding the
+    // port after a reload.
+    return await startRelay()
   },
 })
