@@ -128,12 +128,16 @@ try {
   const rotator = join(stackBin, "warp-rotate.cmd")
   const instanceUsque = join(ROOT, "bin", "usque.exe")
   const instanceRotator = join(ROOT, "bin", "usque-rotate.cmd")
-  if (existsSync(instanceUsque) && existsSync(instanceRotator)) {
+  // The same precedence the launcher uses: the Cloudflare WARP app first
+  // (its rotation is fast), usque as the admin-free fallback.
+  if (existsSync(rotator)) {
+    ok(
+      `rotatable tunnel: the Cloudflare WARP app (${stackBin}) - a rotation is a new exit IP, no administrator rights`,
+    )
+  } else if (existsSync(instanceUsque) && existsSync(instanceRotator)) {
     ok(
       `rotatable tunnel: the instance's own usque (${instanceUsque}) - a rotation is a new exit IP, no administrator rights`,
     )
-  } else if (existsSync(rotator)) {
-    ok(`rotatable tunnel: the WARP stack is there (${stackBin}) - a rotation is a new exit IP`)
   } else if (existsSync("/usr/local/bin/usque")) {
     ok("rotatable tunnel: usque is installed - a rotation is a new exit IP")
   } else if (recorded.startsWith("unavailable")) {
