@@ -1,0 +1,38 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: type-check the relay plugin
+        # The plugin is loaded by opencode's own bundler, which does NOT
+        # type-check - but it does fail on scope errors, and a stray brace in a
+        # big file can silently move a function out of scope (the relay then
+        # fails to load and the instance looks dead). This catches that class of
+        # mistake before it ships.
+        run: |
+          bunx tsc --noEmit --skipLibCheck --target esnext --module esnext \
+            --moduleResolution bundler --lib esnext,dom \
+            plugin/sajilo-relay.ts 2>&1 \
+            | grep -vE "TS2591|TS2868|TS2307|Cannot find name 'process'|Cannot find name 'Bun'|Cannot find type definition|Entry point of type library|If you have issues related to imports|The file is in the program because" \
+            | tee /tmp/tsc.txt
+          test ! -s /tmp/tsc.txt
+
+      - name: syntax-check the shell launchers
+        run: |
+          bash -n sajilo
+          bash -n install.sh
+          bash -n bin/sajilo-rebrand.sh
+
+      - name: build the relay
+        run: bun build --target=bun --external "@opencode/plugin" --external "node:*" plugin/sajilo-relay.ts --outdir /tmp/build
