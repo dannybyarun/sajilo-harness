@@ -126,11 +126,15 @@ try {
     : ""
   const stackBin = join(process.env.LOCALAPPDATA ?? "", "opencode-warp", "bin")
   const rotator = join(stackBin, "warp-rotate.cmd")
-  const hasStack = existsSync(rotator)
-  const hasUsque = existsSync("/usr/local/bin/usque")
-  if (hasStack) {
+  const instanceUsque = join(ROOT, "bin", "usque.exe")
+  const instanceRotator = join(ROOT, "bin", "usque-rotate.cmd")
+  if (existsSync(instanceUsque) && existsSync(instanceRotator)) {
+    ok(
+      `rotatable tunnel: the instance's own usque (${instanceUsque}) - a rotation is a new exit IP, no administrator rights`,
+    )
+  } else if (existsSync(rotator)) {
     ok(`rotatable tunnel: the WARP stack is there (${stackBin}) - a rotation is a new exit IP`)
-  } else if (hasUsque) {
+  } else if (existsSync("/usr/local/bin/usque")) {
     ok("rotatable tunnel: usque is installed - a rotation is a new exit IP")
   } else if (recorded.startsWith("unavailable")) {
     warn("no rotatable tunnel - the relay resets the identity instead (one bucket, not two)")

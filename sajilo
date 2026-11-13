@@ -128,7 +128,11 @@ tunnel_up() {
     https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^warp=on'
 }
 
-have_usque() { command -v usque >/dev/null 2>&1; }
+# usque is the instance's own rotatable tunnel: a user-space WARP client, so
+# installing and rotating it needs no administrator rights. The installer
+# puts it in the instance's bin; a system-wide one is used if it is there.
+have_usque() { [ -x "$BIN_DIR/usque" ] || command -v usque >/dev/null 2>&1; }
+usque_bin() { if [ -x "$BIN_DIR/usque" ]; then echo "$BIN_DIR/usque"; else command -v usque; fi; }
 
 # Is the local Cloudflare WARP proxy listening? The WARP service
 # (warp-svc.exe) exposes it on 127.0.0.1:40000 while WARP is on.
@@ -138,13 +142,14 @@ warp_proxy_up() {
 
 start_tunnel() {
   have_usque || return 1
+  local usque; usque="$(usque_bin)"
   local conf="$TUNNEL_DIR/config.json"
   if [ ! -f "$conf" ]; then
     (cd "$TUNNEL_DIR" && env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
-      usque register -a -c "$conf" -n "sajilo-$(date +%s)") >>"$STATE/register.log" 2>&1
+      "$usque" register -a -c "$conf" -n "sajilo-$(date +%s)") >>"$STATE/register.log" 2>&1
   fi
   (cd "$TUNNEL_DIR" && env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
-    setsid nohup usque -c "$conf" http-proxy -b 127.0.0.1 -p "$TUNNEL_PORT" \
+    setsid nohup "$usque" -c "$conf" http-proxy -b 127.0.0.1 -p "$TUNNEL_PORT" \
     >>"$STATE/usque.log" 2>&1 & echo $! >"$STATE/usque.pid")
   for _ in $(seq 1 30); do
     sleep 1

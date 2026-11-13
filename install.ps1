@@ -42,7 +42,7 @@ function Say([string]$m) { Write-Host "install: $m" }
 function Note([string]$m) { Write-Host "  $m" }
 
 # ---------------------------------------------------------------- layout
-foreach ($d in @((Join-Path $PluginDir "resources"), $StateDir, $WorkDir, $MintDir, $BinDir)) {
+foreach ($d in @((Join-Path $PluginDir "resources"), $StateDir, $WorkDir, $MintDir, $BinDir, (Join-Path $Root "tunnel"))) {
   New-Item -ItemType Directory -Force -Path $d | Out-Null
 }
 Say "root -> $Root"
@@ -136,7 +136,7 @@ if ($launcherSrc -and (Test-Path $launcherSrc)) {
   }
 }
 if ($Here) {
-  foreach ($f in @("warp-rotate.sh", "tunnel-watchdog.sh", "sajilo-rebrand.sh", "sajilo-rebrand.ps1", "sajilo-relay.ts", "sajilo-doctor.ts")) {
+  foreach ($f in @("warp-rotate.sh", "tunnel-watchdog.sh", "usque-rotate.ps1", "usque-rotate.cmd", "sajilo-rebrand.sh", "sajilo-rebrand.ps1", "sajilo-relay.ts", "sajilo-doctor.ts")) {
     $p = Join-Path $Here "bin\$f"
     if (Test-Path $p) { Copy-Item $p (Join-Path $BinDir $f) -Force }
   }
@@ -145,18 +145,31 @@ Say "launcher installed -> $BinDir\sajilo.cmd"
 
 # ---------------------------------------------------------------- tunnel
 # The rotatable tunnel is what makes a NEW exit IP - and a new exit IP is a
-# new quota bucket. It is a separate stack (dannybyarun/opencode-warp):
-# Cloudflare WARP in proxy mode on Windows, usque (a WARP MASQUE
-# reimplementation) on Linux.
+# new quota bucket.
 #
-# This step attaches it automatically, so a machine that never had it ends
-# up with it. It is best effort: the relay works without a tunnel (it resets
-# the identity instead), so a failure here NEVER fails the install. Set
+# There are two ways to get one, and the choice matters:
+#
+#   * Cloudflare WARP (the app) - a Windows SERVICE. Installing and
+#     re-registering it needs Administrator rights, so it means a UAC prompt
+#     and, on a locked-down machine, it simply is not an option.
+#   * usque - a user-space WARP MASQUE client: one binary, one config file,
+#     one HTTP proxy. Registering it writes a file. Rotating it registers a
+#     new anonymous account. NO administrator rights, NO service, NO UAC.
+#
+# So usque is what the installer brings in. The WARP app is still used when
+# it is already there (its proxy is a fine tunnel), but nothing is installed
+# that would need a prompt.
+#
+# The step is best effort: the relay works without a tunnel (it resets the
+# identity instead), so a failure here NEVER fails the install. Set
 # SAJILO_SKIP_TUNNEL=1 to skip it.
-#
-# The stack needs Administrator rights (it installs a service and a WARP
-# registration), so when it is missing the installer re-launches itself
-# elevated and Windows asks once (UAC).
+
+$UsqueVersion = "v4.2.1"
+$UsqueBase = "https://github.com/Diniboy1123/usque/releases/download/$UsqueVersion"
+$UsquePort = if ($env:SAJILO_TUNNEL_PORT) { $env:SAJILO_TUNNEL_PORT } else { "40003" }
+$UsqueBin = Join-Path $BinDir "usque.exe"
+$UsqueConfig = Join-Path $Root "tunnel\config.json"
+$UsqueState = Join-Path $StateDir "usque.pid"
 
 function Test-TcpPort([int]$Port, [int]$TimeoutMs = 800) {
   try {
@@ -170,76 +183,123 @@ function Test-TcpPort([int]$Port, [int]$TimeoutMs = 800) {
   }
 }
 
-function Get-TunnelState {
-  $stackBin = Join-Path $env:LOCALAPPDATA "opencode-warp\bin"
-  $hasStack = (Test-Path (Join-Path $stackBin "warp-rotate.cmd")) -and
-              (Test-Path (Join-Path $stackBin "probe.cmd"))
-  $warpCli = "C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe"
-  $hasWarp = Test-Path $warpCli
-  $proxyUp = Test-TcpPort 40000
-  $kind = "none"
-  if ($hasStack -and $proxyUp) { $kind = "warp-stack" }
-  elseif ($hasWarp -and $proxyUp) { $kind = "warp-only" }
-  return [pscustomobject]@{ Kind = $kind; HasStack = $hasStack; HasWarp = $hasWarp; ProxyUp = $proxyUp; StackBin = $stackBin }
-}
-
-function Install-Tunnel {
-  # The stack's own setup: it installs Cloudflare WARP (winget, else the
-  # MSI), creates the registration and puts WARP into proxy mode on
-  # 127.0.0.1:40000. -SkipOpenCodeInstall because this installer already
-  # handles opencode.
-  $url = "https://raw.githubusercontent.com/dannybyarun/opencode-warp/main/windows/setup.ps1"
-  $tmp = Join-Path $env:TEMP "opencode-warp-setup.ps1"
-  Say "tunnel: fetching the WARP stack setup"
+function Install-Usque {
+  # The asset is named usque_<version>_<os>_<arch>.zip, and the release
+  # ships a checksums.txt - the download is verified, not trusted.
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
+  $asset = "usque_$($UsqueVersion.TrimStart('v'))_windows_$arch.zip"
+  $tmp = Join-Path $env:TEMP "sajilo-usque"
+  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   try {
-    & curl.exe -fsSL -o $tmp $url
-    if ($LASTEXITCODE -ne 0) { throw "download failed: $url" }
+    & curl.exe -fsSL --max-time 180 -o (Join-Path $tmp $asset) "$UsqueBase/$asset"
+    if ($LASTEXITCODE -ne 0) { throw "download failed: $UsqueBase/$asset" }
+    & curl.exe -fsSL --max-time 60 -o (Join-Path $tmp "checksums.txt") "$UsqueBase/checksums.txt"
+    if ($LASTEXITCODE -ne 0) { throw "could not download checksums.txt" }
+    $line = (Get-Content (Join-Path $tmp "checksums.txt") | Where-Object { $_ -match [regex]::Escape($asset) } | Select-Object -First 1)
+    if (-not $line) { throw "no checksum for $asset" }
+    $expected = ($line -split "\s+")[0].ToLower()
+    $actual = (Get-FileHash (Join-Path $tmp $asset) -Algorithm SHA256).Hash.ToLower()
+    if ($expected -ne $actual) { throw "checksum mismatch for $asset" }
+    Expand-Archive -Path (Join-Path $tmp $asset) -DestinationPath (Join-Path $tmp "x") -Force
+    $exe = Get-ChildItem (Join-Path $tmp "x") -Filter "usque.exe" -Recurse | Select-Object -First 1
+    if (-not $exe) { throw "the archive has no usque.exe" }
+    Copy-Item $exe.FullName $UsqueBin -Force
   } catch {
-    Note "tunnel: could not download the setup ($($_.Exception.Message))"
+    Note "tunnel: could not install usque ($($_.Exception.Message))"
     return $false
+  } finally {
+    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
   }
-  $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-  if (-not $isAdmin) {
-    Note "tunnel: Windows will ask for administrator rights once (UAC)"
-    try {
-      $p = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $tmp, "-SkipOpenCodeInstall"
-      )
-      if ($p.ExitCode -ne 0) { Note "tunnel: the elevated setup exited with $($p.ExitCode)" }
-    } catch {
-      Note "tunnel: the elevated setup did not run ($($_.Exception.Message))"
-    }
-  } else {
-    try {
-      & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmp -SkipOpenCodeInstall
-    } catch {
-      Note "tunnel: the setup failed ($($_.Exception.Message))"
-    }
-  }
-  Remove-Item $tmp -Force -ErrorAction SilentlyContinue
   return $true
 }
 
-$tunnel = Get-TunnelState
+function Register-Usque {
+  # usque must reach Cloudflare itself: an inherited proxy would send it
+  # through the tunnel it is meant to replace.
+  $env:HTTPS_PROXY = ""; $env:HTTP_PROXY = ""; $env:https_proxy = ""; $env:http_proxy = ""
+  $name = "sajilo-" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  try {
+    # usque writes its progress to STDERR (including a harmless "Config file
+    # not found" on a first run), and this script runs with
+    # ErrorActionPreference=Stop - so stderr would abort the install. The
+    # preference is relaxed around the call and the CONFIG FILE is what
+    # decides whether the registration worked.
+    $oldPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+      $out = & $UsqueBin register -a -c $UsqueConfig -n $name 2>&1
+      $rc = $LASTEXITCODE
+    } finally {
+      $ErrorActionPreference = $oldPref
+    }
+    if (-not (Test-Path $UsqueConfig)) { throw "register failed (rc=$rc): $out" }
+  } catch {
+    Note "tunnel: usque could not register ($($_.Exception.Message))"
+    return $false
+  }
+  return $true
+}
+
+function Start-Usque {
+  $env:HTTPS_PROXY = ""; $env:HTTP_PROXY = ""; $env:https_proxy = ""; $env:http_proxy = ""
+  $log = Join-Path $StateDir "usque.log"
+  $proc = Start-Process -FilePath $UsqueBin -ArgumentList @(
+    "-c", $UsqueConfig, "http-proxy", "-b", "127.0.0.1", "-p", $UsquePort
+  ) -WindowStyle Hidden -PassThru -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+  $proc.Id | Set-Content $UsqueState -Encoding ascii
+  for ($i = 0; $i -lt 12; $i++) {
+    Start-Sleep -Milliseconds 500
+    if (Test-TcpPort ([int]$UsquePort)) { return $true }
+  }
+  return $false
+}
+
+function Get-TunnelState {
+  # usque: the instance's own rotatable tunnel (no admin).
+  if (Test-Path $UsqueBin) {
+    return [pscustomobject]@{ Kind = "usque"; Rotatable = $true; Proxy = "http://127.0.0.1:$UsquePort"; Up = (Test-TcpPort ([int]$UsquePort)) }
+  }
+  # the WARP stack: its proxy is a fine tunnel, and its rotator is there too.
+  $stackBin = Join-Path $env:LOCALAPPDATA "opencode-warp\bin"
+  if ((Test-Path (Join-Path $stackBin "warp-rotate.cmd")) -and (Test-TcpPort 40000)) {
+    return [pscustomobject]@{ Kind = "warp-stack"; Rotatable = $true; Proxy = "http://127.0.0.1:40000"; Up = $true }
+  }
+  return [pscustomobject]@{ Kind = "none"; Rotatable = $false; Proxy = ""; Up = $false }
+}
+
 if ($env:SAJILO_SKIP_TUNNEL -eq "1") {
   Say "tunnel skipped (SAJILO_SKIP_TUNNEL=1) - the relay will use the machine's own egress"
   "skipped by SAJILO_SKIP_TUNNEL=1" | Set-Content (Join-Path $StateDir "tunnel.txt")
-} elseif ($tunnel.Kind -eq "warp-stack") {
-  Say "tunnel: the rotatable WARP proxy is already there ($($tunnel.StackBin))"
-  "warp-stack: $($tunnel.StackBin)" | Set-Content (Join-Path $StateDir "tunnel.txt")
 } else {
-  Note "tunnel: no rotatable WARP proxy found - installing it now"
-  if (Install-Tunnel) {
-    $tunnel = Get-TunnelState
-    if ($tunnel.Kind -eq "warp-stack") {
-      Say "tunnel: the rotatable WARP proxy is up (127.0.0.1:40000)"
-      "warp-stack: $($tunnel.StackBin)" | Set-Content (Join-Path $StateDir "tunnel.txt")
-    } else {
-      Note "tunnel: still not there - the relay will use the machine's own egress"
-      "unavailable: $($tunnel.Kind)" | Set-Content (Join-Path $StateDir "tunnel.txt")
+  # usque is the tunnel the instance uses: it installs AND rotates without
+  # administrator rights. The Cloudflare WARP app is only the fallback,
+  # because re-registering it is a service operation (admin).
+  $haveUsque = Test-Path $UsqueBin
+  if ($haveUsque -and -not (Test-TcpPort ([int]$UsquePort))) {
+    Note "tunnel: usque is installed but not running - starting it"
+    if (-not (Start-Usque)) { $haveUsque = $false }
+  }
+  if (-not $haveUsque) {
+    Note "tunnel: installing usque (a user-space WARP client - no administrator rights, no UAC)"
+    if ((Install-Usque) -and (Register-Usque) -and (Start-Usque)) {
+      $haveUsque = $true
     }
+  }
+  if ($haveUsque) {
+    Say "tunnel: usque on http://127.0.0.1:$UsquePort - a rotation is a new exit IP, no admin needed"
+    "usque: http://127.0.0.1:$UsquePort" | Set-Content (Join-Path $StateDir "tunnel.txt")
   } else {
-    "unavailable: could not install" | Set-Content (Join-Path $StateDir "tunnel.txt")
+    # Fall back to the WARP app if it is already there: its proxy is a usable
+    # tunnel even if rotating it needs admin.
+    $stackBin = Join-Path $env:LOCALAPPDATA "opencode-warp\bin"
+    if ((Test-Path (Join-Path $stackBin "warp-rotate.cmd")) -and (Test-TcpPort 40000)) {
+      Say "tunnel: the Cloudflare WARP app's proxy on http://127.0.0.1:40000 (rotating it needs administrator rights)"
+      "warp-stack: http://127.0.0.1:40000" | Set-Content (Join-Path $StateDir "tunnel.txt")
+    } else {
+      Say "tunnel: not available - the relay resets the identity instead (one bucket, not two)"
+      "unavailable" | Set-Content (Join-Path $StateDir "tunnel.txt")
+    }
   }
 }
 

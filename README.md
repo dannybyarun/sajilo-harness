@@ -77,14 +77,25 @@ bash install.sh
 | harness spec | the relay plugin and the prompt/tool resources, from the clone or downloaded from the repo |
 | launcher | `sajilo` on your PATH, plus a desktop shortcut (Windows) or launcher (Linux) |
 | runtime | your existing opencode is used and pinned; if the machine has none, the standalone build is downloaded into the instance |
-| **tunnel** | the rotatable WARP proxy is **installed if it is missing** - Cloudflare WARP in proxy mode on Windows, `usque` as a systemd service on Linux (the [opencode-warp](https://github.com/dannybyarun/opencode-warp) stack) |
+| **tunnel** | the rotatable WARP tunnel is **installed if it is missing** - `usque`, a user-space WARP client: one binary, one config file, one HTTP proxy. **No administrator rights, no service, no UAC.** Rotating it is registering a new anonymous account |
 
 The tunnel step is what makes a **new exit IP** possible, and a new exit IP is
-a new quota bucket. It needs Administrator rights (it installs a service and
-a WARP registration), so on Windows the installer re-launches itself elevated
-and Windows asks once (UAC). It is **best effort**: a machine that cannot
-have the tunnel still gets a working relay - it resets the identity instead
-of rotating the IP. Skip it with `SAJILO_SKIP_TUNNEL=1`.
+a new quota bucket. There are two ways to get one:
+
+- **`usque`** - a user-space MASQUE client. Installing it is downloading a
+  binary; rotating it is writing a config file. No admin, ever.
+- the **Cloudflare WARP app** - a Windows *service*. Its proxy is fine, but
+  re-registering it is a service operation, so it needs admin. It is used
+  only when it is already there.
+
+The step is **best effort**: a machine that cannot have the tunnel still gets
+a working relay - it resets the identity instead of rotating the IP. Skip it
+with `SAJILO_SKIP_TUNNEL=1`.
+
+One honest caveat: Cloudflare sometimes hands the same address to two
+registrations in the same colo, so a rotation is *usually* a new exit IP. The
+rotator retries until the address actually changes, and reports the
+registration id as the certain signal.
 
 Nothing is overwritten in your existing opencode: Sajilo keeps its own HOME,
 its own database and its own ports.
@@ -512,8 +523,8 @@ canary: if it ever fails, something rotated a model again.
 |---|---|---|
 | separate HOME, DB, sessions, project | yes | yes |
 | own relay (port 43914) with ladder/budget/reset | yes | yes |
-| own **rotatable** WARP tunnel (usque) | yes (if `usque` is present) | yes (the opencode-warp stack) |
-| egress recovery by rotating the IP | yes | yes - `warp-rotate.cmd` gives a new exit IP, which is a new bucket |
+| own **rotatable** WARP tunnel | yes (`usque`) | yes (`usque` - no admin) |
+| egress recovery by rotating the IP | yes | yes - `usque-rotate.cmd` gives a new exit IP, no admin |
 | the live opencode is unaffected | yes | yes |
 
 On Windows the tunnel is **Cloudflare WARP** (`warp-svc.exe`, in proxy mode on

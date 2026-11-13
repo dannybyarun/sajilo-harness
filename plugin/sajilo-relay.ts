@@ -664,6 +664,29 @@ function egressRotationEnabled(): boolean {
 }
 
 /**
+ * The instance root, derived from where this plugin lives: the plugin is at
+ * <root>/home/.config/opencode/plugin/sajilo-relay.ts.
+ */
+function instanceRoot(): string {
+  const dir = RELAY_DIR.replace(/[\\/]+$/, "")
+  const cut = dir.replace(/[\\/]home[\\/]\.config[\\/]opencode[\\/]plugin$/i, "")
+  return cut === dir ? "" : cut
+}
+
+/**
+ * The instance's own usque rotator, when it has one. usque is a user-space
+ * WARP client: rotating it means registering a new anonymous account, which
+ * needs no administrator rights - unlike the Cloudflare WARP app, which is a
+ * service.
+ */
+function instanceUsqueRotator(): string | undefined {
+  const root = instanceRoot()
+  if (!root) return undefined
+  const p = `${root}/bin/usque-rotate.cmd`
+  return existsSync(p) ? p : undefined
+}
+
+/**
  * Do the reset: rotate the egress, then mint a fresh session/project pair.
  * Never rejects - a failed reset is a result, not an exception.
  */
@@ -674,12 +697,12 @@ async function performReset(reason: string): Promise<ResetResult> {
   // rotate ITS OWN tunnel. A hardcoded path meant sajilo's rescue chain
   // rotated the LIVE tunnel.
   //
-  // Windows has its own rotator: the opencode-warp stack ships
-  // warp-rotate.cmd (--rotate-only), and there is no --restart-only there.
+  // Windows has its own rotator: the instance's usque-rotate.cmd (usque is a
+  // user-space WARP client, so rotating it needs no administrator rights).
+  // The opencode-warp stack's warp-rotate.cmd is the fallback.
   const isWindows = process.platform === "win32"
   const ROTATOR = isWindows
-    ? (env("RELAY_ROTATOR") ??
-      `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`)
+    ? (env("RELAY_ROTATOR") ?? instanceUsqueRotator() ?? `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`)
     : (env("RELAY_ROTATOR") ?? "/usr/local/lib/opencode-warp/warp-rotate.sh")
   const RESCUE_LOG =
     env("RELAY_RESCUE_LOG") ?? "/tmp/sajilo/rescue.log"
@@ -2056,6 +2079,13 @@ function startServer(): void {
         }
       },
       })
+      // Register the server so a RELOAD of this plugin in THIS process can
+      // take the port over from the previous copy of itself. Without this the
+      // registry never held a server, the takeover was a no-op, and every
+      // plugin reload left the OLD build serving - so an edit to the relay
+      // looked like it had done nothing.
+      RELAY_REGISTRY.server = server
+      RELAY_REGISTRY.ownerPid = process.pid
 }
 /**
  * Start the relay. Callable from the opencode runtime (as the plugin below)
@@ -2199,15 +2229,21 @@ export async function startRelay(): Promise<void> {
         return
       }
       process.stderr.write(
-        `[sajilo-relay] port ${PORT} still held by our previous instance (pid ${process.pid}); waiting for it to release\n`,
+        `[sajilo-relay] port ${PORT} still held by our previous instance (pid ${process.pid}); taking it over\n`,
       )
+      // It is OUR previous copy of this module that owns the port - a plugin
+      // RELOAD in this same process - and the registry holds that server. Stop
+      // it and serve the new code. Without this, every reload left the OLD
+      // build serving and an edit to the relay looked like it had done
+      // nothing at all.
+      takeOverOwnServer()
       // opencode's plugin activation has a HARD 5 s budget: if setup() has
       // not resolved by then, every location-scoped API answers 503
       // "Location plugins did not finish activating". So the wait here is
       // deliberately short - the stand-by takeover (startTakeover) binds the
       // port as soon as it frees up, without blocking the activation.
-      for (let i = 0; i < 5; i++) {
-        await Bun.sleep(250)
+      for (let i = 0; i < 8; i++) {
+        await Bun.sleep(100)
         if (!(await healthyRelayOn(PORT))) break
       }
       if (await healthyRelayOn(PORT)) {

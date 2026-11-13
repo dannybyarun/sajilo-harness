@@ -97,16 +97,33 @@ set "SAJILO_RELAY_MODEL_FILE=%MODEL_FILE%"
 set "SAJILO_RELAY_DUMP_DIR=%STATE%"
 set "SAJILO_RELAY_RUNTIME=%OPENCODE_BIN%"
 set "SAJILO_ROTATE_MARKER=%STATE%\.rotate.inprogress"
-REM No usque on Windows: the sajilo relay uses the device's native egress and
-REM has no proxy of its own, so it never shares a bucket with another opencode.
+REM The instance's own tunnel port: the usque proxy (and, on Linux, the
+REM usque tunnel) lives here.
+if "%SAJILO_TUNNEL_PORT%"=="" set "SAJILO_TUNNEL_PORT=40003"
+REM The instance runs with its own egress: it clears the ambient proxy so it
+REM never shares a bucket with another opencode, and picks its own tunnel leg
+REM below.
 set "HTTPS_PROXY="
 set "HTTP_PROXY="
-REM The proxied leg of the egress ladder. A second egress is a second quota
-REM bucket - the free allowance is keyed on the exit IP - so a drained bucket
-REM can be climbed over instead of answered. The Cloudflare WARP service
-REM (warp-svc.exe) listens on 127.0.0.1:40000 while WARP is on, and that is
-REM the local proxy to use. Whatever the user set is kept.
-if "%SAJILO_RELAY_PROXY%"=="" (
+REM The tunnel leg of the egress ladder, and the rotator that gives it a new
+REM exit IP (a new quota bucket).
+REM
+REM usque is preferred: it is a user-space WARP client (one binary, one
+REM config file), so installing AND rotating it needs no administrator
+REM rights and no UAC prompt. The Cloudflare WARP app is the alternative
+REM (its proxy is on 127.0.0.1:40000), but it is a service - registering it
+REM again needs admin, so it is only used when it is already there.
+if exist "%ROOT%\bin\usque.exe" (
+  if not exist "%ROOT%\tunnel" mkdir "%ROOT%\tunnel" >nul 2>&1
+  netstat -ano | findstr /R /C:"127.0.0.1:%SAJILO_TUNNEL_PORT% .*LISTENING" >nul 2>&1
+  if errorlevel 1 (
+    set "HTTPS_PROXY="
+    set "HTTP_PROXY="
+    start "" /b "%ROOT%\bin\usque.exe" -c "%ROOT%\tunnel\config.json" http-proxy -b 127.0.0.1 -p %SAJILO_TUNNEL_PORT% >>"%STATE%\usque.log" 2>>"%STATE%\usque.log.err"
+  )
+  set "SAJILO_RELAY_PROXY=http://127.0.0.1:%SAJILO_TUNNEL_PORT%"
+  set "SAJILO_RELAY_ROTATOR=%ROOT%\bin\usque-rotate.cmd"
+) else (
   netstat -ano | findstr /R /C:"127.0.0.1:40000 .*LISTENING" >nul 2>&1
   if not errorlevel 1 set "SAJILO_RELAY_PROXY=http://127.0.0.1:40000"
 )

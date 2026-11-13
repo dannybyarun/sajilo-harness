@@ -115,11 +115,11 @@ fi
 # ---------------------------------------------------------------- launcher
 if [ -n "$HERE" ] && [ -f "$HERE/sajilo" ]; then
   cp -f "$HERE/sajilo" "$BIN_DIR/sajilo"
-  for f in warp-rotate.sh tunnel-watchdog.sh sajilo-rebrand.sh sajilo-rebrand.ps1 sajilo-relay.ts sajilo-doctor.ts; do
+  for f in warp-rotate.sh tunnel-watchdog.sh usque-rotate.ps1 usque-rotate.cmd sajilo-rebrand.sh sajilo-rebrand.ps1 sajilo-relay.ts sajilo-doctor.ts; do
     [ -f "$HERE/bin/$f" ] && cp -f "$HERE/bin/$f" "$BIN_DIR/"
   done
 elif curl -fsSL "$REPO_URL/sajilo" -o "$BIN_DIR/sajilo"; then
-  for f in warp-rotate.sh tunnel-watchdog.sh sajilo-rebrand.sh sajilo-rebrand.ps1 sajilo-relay.ts sajilo-doctor.ts; do
+  for f in warp-rotate.sh tunnel-watchdog.sh usque-rotate.ps1 usque-rotate.cmd sajilo-rebrand.sh sajilo-rebrand.ps1 sajilo-relay.ts sajilo-doctor.ts; do
     curl -fsSL "$REPO_URL/bin/$f" -o "$BIN_DIR/$f" 2>/dev/null || true
   done
 else
@@ -134,54 +134,71 @@ say "launcher installed -> $BIN_DIR/sajilo"
 
 # ---------------------------------------------------------------- tunnel
 # The rotatable tunnel is what makes a NEW exit IP - and a new exit IP is a
-# new quota bucket. It is a separate stack (dannybyarun/opencode-warp): usque
-# (a WARP MASQUE reimplementation) as a systemd service on Linux, Cloudflare
-# WARP in proxy mode on Windows.
+# new quota bucket.
 #
-# This step attaches it automatically, so a machine that never had it ends up
-# with it. It is best effort: the relay works without a tunnel (it resets the
-# identity instead), so a failure here NEVER fails the install. Set
-# SAJILO_SKIP_TUNNEL=1 to skip it.
-WARP_REPO_URL="https://raw.githubusercontent.com/dannybyarun/opencode-warp/main"
+# usque is a user-space WARP MASQUE client: one binary, one config file, one
+# HTTP proxy. Installing it is downloading a binary; rotating it is writing a
+# config file. NO administrator rights, NO service, NO systemd unit - so
+# nothing here asks the user to do anything.
+#
+# The launcher (sajilo) registers it and runs it for this instance; the
+# rotator gives it a new identity.
+#
+# Best effort: the relay works without a tunnel (it resets the identity
+# instead), so a failure here NEVER fails the install. SAJILO_SKIP_TUNNEL=1
+# skips it.
+USQUE_VERSION="${USQUE_VERSION:-v4.2.1}"
+USQUE_BASE="https://github.com/Diniboy1123/usque/releases/download/${USQUE_VERSION}"
+USQUE_BIN="$BIN_DIR/usque"
 
-tunnel_state() {
-  if [ -x /usr/local/bin/usque ] || command -v usque >/dev/null 2>&1; then
-    echo "usque: $(command -v usque || echo /usr/local/bin/usque)"
-  elif [ -f /usr/local/lib/opencode-warp/warp-rotate.sh ]; then
-    echo "warp-stack: /usr/local/lib/opencode-warp"
-  else
-    echo "none"
-  fi
+usque_asset() {
+  os=$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  case "$os" in
+    linux) os=linux ;;
+    darwin) os=darwin ;;
+    *) return 1 ;;
+  esac
+  arch=$(uname -m 2>/dev/null)
+  case "$arch" in
+    x86_64|amd64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) return 1 ;;
+  esac
+  echo "usque_${USQUE_VERSION#v}_${os}_${arch}.zip"
 }
 
-install_tunnel() {
-  tmp=$(mktemp -d 2>/dev/null || echo "$TMPDIR/sajilo-tunnel.$$")
+install_usque() {
+  asset="$(usque_asset)" || { say "tunnel: no usque build for this platform"; return 1; }
+  tmp=$(mktemp -d 2>/dev/null || echo "$TMPDIR/sajilo-usque.$$")
   mkdir -p "$tmp"
   ok=1
-  for f in setup.sh usque-setup.sh; do
-    curl -fsSL "$WARP_REPO_URL/$f" -o "$tmp/$f" 2>/dev/null || ok=0
-  done
+  curl -fsSL --max-time 180 -o "$tmp/$asset" "$USQUE_BASE/$asset" 2>/dev/null || ok=0
+  curl -fsSL --max-time 60 -o "$tmp/checksums.txt" "$USQUE_BASE/checksums.txt" 2>/dev/null || ok=0
   if [ "$ok" != "1" ]; then
-    say "tunnel: could not download the WARP stack setup"
+    say "tunnel: could not download usque ($asset)"
+    rm -rf "$tmp" 2>/dev/null || true
     return 1
   fi
-  chmod +x "$tmp"/*.sh 2>/dev/null || true
-  # The stack installs into /usr/local, so it needs root. sudo asks for the
-  # password once; without sudo we say exactly what to run and move on.
-  if [ "$(id -u)" -eq 0 ]; then
-    SUDO=""
-  elif command -v sudo >/dev/null 2>&1; then
-    SUDO="sudo"
+  # Verify the download against the release's checksums.
+  want=$(grep " $asset\$" "$tmp/checksums.txt" 2>/dev/null | awk '{print $1}' | head -1)
+  got=$(sha256sum "$tmp/$asset" 2>/dev/null | awk '{print $1}')
+  if [ -n "$want" ] && [ "$want" != "$got" ]; then
+    say "tunnel: the usque checksum does not match - refusing to install it"
+    rm -rf "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q -o "$tmp/$asset" -d "$tmp/x" 2>/dev/null || true
   else
-    say "tunnel: needs root - run: sudo sh $tmp/setup.sh && sudo sh $tmp/usque-setup.sh"
+    python3 -m zipfile -e "$tmp/$asset" "$tmp/x" 2>/dev/null || true
+  fi
+  bin=$(find "$tmp/x" -maxdepth 2 -name usque -type f 2>/dev/null | head -1)
+  if [ -z "$bin" ]; then
+    say "tunnel: the usque archive has no binary"
+    rm -rf "$tmp" 2>/dev/null || true
     return 1
   fi
-  note "tunnel: installing the WARP stack (usque)"
-  $SUDO sh "$tmp/setup.sh" >/dev/null 2>&1 || true
-  # usque is the rotatable proxy: a systemd service on 127.0.0.1:40001.
-  if command -v systemctl >/dev/null 2>&1; then
-    $SUDO sh "$tmp/usque-setup.sh" >/dev/null 2>&1 || true
-  fi
+  cp -f "$bin" "$USQUE_BIN" && chmod +x "$USQUE_BIN"
   rm -rf "$tmp" 2>/dev/null || true
   return 0
 }
@@ -189,25 +206,17 @@ install_tunnel() {
 if [ "${SAJILO_SKIP_TUNNEL:-}" = "1" ]; then
   say "tunnel skipped (SAJILO_SKIP_TUNNEL=1) - the relay will use the machine's own egress"
   echo "skipped by SAJILO_SKIP_TUNNEL=1" >"$STATE_DIR/tunnel.txt"
+elif command -v usque >/dev/null 2>&1 || [ -x "$USQUE_BIN" ]; then
+  say "tunnel: usque is available ($(command -v usque || echo "$USQUE_BIN")) - a rotation is a new exit IP, no admin needed"
+  echo "usque: $(command -v usque || echo "$USQUE_BIN")" >"$STATE_DIR/tunnel.txt"
 else
-  TUNNEL="$(tunnel_state)"
-  if [ "$TUNNEL" != "none" ]; then
-    say "tunnel: the rotatable WARP proxy is already there ($TUNNEL)"
-    echo "$TUNNEL" >"$STATE_DIR/tunnel.txt"
+  note "tunnel: installing usque (a user-space WARP client - no administrator rights, no systemd)"
+  if install_usque; then
+    say "tunnel: usque installed -> $USQUE_BIN - the launcher starts it for this instance"
+    echo "usque: $USQUE_BIN" >"$STATE_DIR/tunnel.txt"
   else
-    note "tunnel: no rotatable WARP proxy found - installing it now"
-    if install_tunnel; then
-      TUNNEL="$(tunnel_state)"
-      if [ "$TUNNEL" != "none" ]; then
-        say "tunnel: the rotatable WARP proxy is up ($TUNNEL)"
-        echo "$TUNNEL" >"$STATE_DIR/tunnel.txt"
-      else
-        say "tunnel: still not there - the relay will use the machine's own egress"
-        echo "unavailable" >"$STATE_DIR/tunnel.txt"
-      fi
-    else
-      echo "unavailable" >"$STATE_DIR/tunnel.txt"
-    fi
+    say "tunnel: not available - the relay resets the identity instead (one bucket, not two)"
+    echo "unavailable" >"$STATE_DIR/tunnel.txt"
   fi
 fi
 
