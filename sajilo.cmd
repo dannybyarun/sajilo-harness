@@ -157,13 +157,14 @@ if /i "%~1"=="status" (
   echo db         : %HOME_DIR%\.local\share\opencode\opencode.db
   echo project    : %TARGET%
   echo runtime    : %OPENCODE_BIN%
-  if "%MODEL_ID%"=="" (echo model       : auto ^(the relay rotates the free pool^)) else (echo model       : %MODEL_ID%)
+  if "%MODEL_ID%"=="" (echo model       : auto ^(the relay resets the limit, it never rotates models^)) else (echo model       : %MODEL_ID%)
   echo tunnel     : none on Windows ^(native egress^)
   echo base url   : http://127.0.0.1:%RELAY_PORT%/v1 - or /openai/v1
   exit /b 0
 )
 
 if /i "%~1"=="rebrand" goto :do_rebrand
+if /i "%~1"=="mint" goto :do_mint
 if /i "%~1"=="doctor" goto :do_doctor
 if /i "%~1"=="relay" goto :do_relay
 if /i "%~1"=="model" goto :do_model
@@ -172,6 +173,14 @@ if /i "%~1"=="shell" goto :do_shell
 if /i "%~1"=="serve" goto :do_serve
 if /i "%~1"=="direct" goto :do_direct
 goto :do_tui
+
+REM --- mint: a fresh session/project pair -> a fresh quota bucket ------------
+:do_mint
+curl -s -m 180 -X POST "http://127.0.0.1:%RELAY_PORT%/relay-mint?force=1" -H "content-type: application/json" -d "{}"
+echo.
+echo A fresh pair means a fresh bucket: every free model's pool for THIS
+echo identity starts over, so a drained model becomes usable again.
+exit /b 0
 
 REM --- doctor: is the harness and the relay healthy? -------------------------
 :do_doctor
@@ -268,14 +277,14 @@ echo                  still covers it if that model is drained)
 goto :model_end
 :model_show
 if "%MODEL_ID%"=="" (
-  echo model        : auto ^(the relay rotates the free pool^)
+  echo model        : auto ^(the relay resets the limit, it never rotates models^)
 ) else (
   echo model        : %MODEL_ID%
 )
 goto :model_end
 :model_clear
 if exist "%MODEL_FILE%" del /q "%MODEL_FILE%"
-echo model        : auto ^(the relay rotates the free pool^)
+echo model        : auto ^(the relay resets the limit, it never rotates models^)
 :model_end
 exit /b 0
 

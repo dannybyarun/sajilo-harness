@@ -4,9 +4,9 @@
 //
 // This is the provider other agents talk to. It is an OpenAI-compatible
 // endpoint that rewrites every request into the gateway's approved agent
-// class, rotates the free pool when a model is drained, survives a dead proxy
-// (the egress ladder), and never parks a request for minutes (the spin
-// budget).
+// class, resets the limit when a model's window is empty (never rotates
+// models), survives a dead proxy (the egress ladder), and never hands the
+// caller a rate-limit error.
 //
 // It is the same code the runtime loads as a plugin - startRelay() - so the
 // behaviour is identical either way.

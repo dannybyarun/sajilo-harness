@@ -137,10 +137,10 @@ if (proxy) {
   warn("no proxied leg - only one exit IP, so one bucket")
 }
 
-// --- the rotation record ----------------------------------------------------
+// --- the reset record --------------------------------------------------------
 // The relay logs every decision it makes. Summarise the recent ones so the
 // state of the free allowance is readable at a glance.
-console.log("\nrotation record")
+console.log("\nreset record")
 try {
   const log = readFileSync(join(STATE, "relay-activity.log"), "utf8")
   const lines = log.split("\n").filter((l) => l.startsWith("["))
@@ -148,14 +148,15 @@ try {
   const ok200 = last.filter((l) => l.includes("UPSTREAM 200")).length
   const spins = last.filter((l) => l.includes("SPIN 429 on")).length
   const climbs = last.filter((l) => l.includes("trying the native egress")).length
-  const rescues = last.filter((l) => l.includes("RESCUE kicked")).length
+  const resets = last.filter((l) => l.includes("RESET kicked")).length
+  const landed = last.filter((l) => l.includes("RESET landed")).length
   const perModel = new Map<string, number>()
   for (const l of last) {
     const m = /SPIN 429 on ([^\s(]+)/.exec(l)
     if (m) perModel.set(m[1], (perModel.get(m[1]) ?? 0) + 1)
   }
   const drained = [...perModel.entries()].sort((a, b) => b[1] - a[1])
-  ok(`${ok200} upstream 200s, ${spins} model 429s, ${climbs} ladder climbs, ${rescues} rescues (last ${last.length} log lines)`)
+  ok(`${ok200} upstream 200s, ${spins} model 429s, ${climbs} ladder climbs, ${landed}/${resets} resets landed (last ${last.length} log lines)`)
   if (drained.length) {
     const top = drained.slice(0, 4).map(([m, n]) => `${m}:${n}`).join(", ")
     warn(`models hitting 429 most: ${top}`)
@@ -169,10 +170,17 @@ try {
     const m = /] SERVED (\S+)(.*)$/.exec(served)
     ok(`last model that answered: ${m?.[1] ?? "?"}${m?.[2]?.trim() ? ` ${m[2].trim()}` : ""}`)
   }
+  // The rule: the caller always gets the model it asked for. A request
+  // answered by a different model means the relay rotated - which it must
+  // not do any more, because a rotation changes the answer, not the quota.
   const rotations = last.filter((l) => l.includes("SPIN fallback used")).length
-  if (rotations) warn(`${rotations} request(s) in the last ${last.length} lines were answered by a different model than requested`)
+  if (rotations) {
+    bad(`${rotations} request(s) were answered by a model the caller did not ask for - the relay must reset the limit, never rotate models`)
+  } else {
+    ok("every request was answered by the model it asked for")
+  }
 } catch (e) {
-  warn(`no rotation record yet: ${e}`)
+  warn(`no reset record yet: ${e}`)
 }
 
 // --- the gateway ------------------------------------------------------------

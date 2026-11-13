@@ -183,9 +183,10 @@ use_native() {
 
 # Point sajilo's opencode at sajilo RELAY. Then the opencode client inherits
 # everything the relay knows how to do: the gateway whitelist (the relay
-# rewrites the body into the approved agent class), the free-model pool
-# rotation, the egress ladder (proxy -> native), the spin budget (no
-# multi-minute hangs) and the rescue chain. Without this the opencode client
+# rewrites the body into the approved agent class), the limit reset (a 429
+# gets a fresh identity, and the SAME model answers), the egress ladder
+# (proxy -> native), and the keep-working rule (no multi-minute hangs, and no
+# rate-limit error in the user's face). Without this the opencode client
 # talks to the gateway directly and has NONE of that: one dead proxy and it
 # fails with the gateway's own error.
 use_relay() {
@@ -222,12 +223,12 @@ model_cmd() {
       if [ -n "$MODEL_ID" ]; then
         echo "model        : $MODEL_ID"
       else
-        echo "model        : auto (the relay rotates the free pool)"
+        echo "model        : auto (the relay resets the limit, it never rotates models)"
       fi
       ;;
     --auto)
       rm -f "$MODEL_FILE" 2>/dev/null || true
-      echo "model        : auto (the relay rotates the free pool)"
+      echo "model        : auto (the relay resets the limit, it never rotates models)"
       ;;
     *)
       mkdir -p "$STATE" 2>/dev/null || true
@@ -249,7 +250,7 @@ status() {
   if [ -n "$MODEL_ID" ]; then
     echo "model       : $MODEL_ID"
   else
-    echo "model       : auto (the relay rotates the free pool)"
+    echo "model       : auto (the relay resets the limit, it never rotates models)"
   fi
   echo "usque       : $(have_usque && echo available || echo 'not installed - native egress only')"
   echo "live relay  : $(curl -s -m 5 http://127.0.0.1:43904/relay-health 2>/dev/null || echo 'not running')"
@@ -260,6 +261,18 @@ case "${1:-tui}" in
   rebrand)
     shift
     exec bash "$(dirname "$0")/sajilo-rebrand.sh" "$@"
+    ;;
+  mint)
+    # A fresh session/project pair means a fresh quota bucket: every free
+    # model's pool for THIS identity starts over, so a drained model becomes
+    # usable again. Measured: deepseek had been 429ing for minutes, and after
+    # one mint it served again.
+    # ?force=1 skips the mint cooldown - asking for a mint means asking NOW.
+    curl -s -m 180 -X POST "http://127.0.0.1:$RELAY_PORT/relay-mint?force=1" \
+      -H "content-type: application/json" -d "{}"
+    echo
+    echo "A fresh pair means a fresh bucket: every free model's pool for THIS"
+    echo "identity starts over, so a drained model becomes usable again."
     ;;
   doctor)
     # Is the harness and the relay healthy?

@@ -468,14 +468,32 @@ function transformBody(raw: string): string {
 
 const callerStreamWants = new WeakMap<Request, boolean>()
 
-// ---- resilient fallbacks (Nov 10 2026) ------------------------------------
-// Free limits are rolling windows over per-model pools and per-project
-// identity. Freebuff does not retry, so the relay does: rotate models
-// transparently, then wait-and-retry, then (last resort) rotate identity in
-// the background so the next attempt picks up a fresh pair.
+// ---- the 429 path: reset the limit, keep the model (Nov 13 2026) -----------
+// The free allowance is a rolling window over per-model pools AND per-project
+// identity. So a 429 does NOT mean "this model is gone" - it means THIS
+// identity's window for THIS model is empty. The cure is a fresh identity
+// (a new session/project pair, and a new egress IP), never a different
+// model.
+//
+// So the relay never changes the model: it resets the limit and retries the
+// model the caller asked for. Measured on this instance: a reset lands in
+// 14-22 s and the requested model serves again immediately (18/20, 77/81 and
+// 12/12 of the requests in the 90 s after a reset were served by the
+// REQUESTED model), while the old pool rotation answered 15% of all requests
+// with a model nobody had asked for.
+//
+// The caller never sees a rate-limit error either, and the relay never
+// gives up on a request while the client is still there: it keeps working -
+// waiting out the refill the gateway announced, resetting the identity,
+// rotating the egress - for as long as it takes. Only if the client is
+// still connected after the ceiling does it answer 503 + Retry-After (a
+// retryable status that is not a quota error), and even then the reset keeps
+// running in the background, so the client's next attempt lands on a fresh
+// identity.
+//
 // The free pool is not hand-picked: the gateway publishes the whole
 // catalogue at GET /inference/openai/v1/models (which is NOT behind the
-// whitelist Ã¢â‚¬â€ a bare curl gets it), and it lists exactly eleven free models.
+// whitelist - a bare curl gets it), and it lists exactly eleven free models.
 // Ten of them are text-capable chat models; nemotron-3.5-super-vl-free is
 // vision-first, so it stays last. minimax-m3.1-flash-free was missing from
 // the original hand-written list even though it is one of the free models.
@@ -496,10 +514,6 @@ const FREE_POOL_FALLBACK = [
   "minimax-m3.1-flash-free",
   "nemotron-3.5-super-vl-free",
 ]
-
-function modelPool(origin: string): string[] {
-  return [origin, ...FREE_POOL_FALLBACK.filter((m) => m !== origin)]
-}
 
 /**
  * The catalogue served to clients. Only the free pool: the gateway lists 85
@@ -537,7 +551,7 @@ function modelPin(): string | null {
     const m = readFileSync(f, "utf8").trim()
     if (m) return m
   } catch {
-    /* no pin file Ã¢â‚¬â€ the runtime's own choice is used */
+    /* no pin file - the runtime's own choice is used */
   }
   return null
 }
@@ -587,30 +601,42 @@ function applyModelIdentity(body: string, model: string): string {
   }
 }
 
-function mintPair(reason: string): void {
-  if (env("RELAY_AUTOMINT") === "0") return
-  void (async () => {
-    const r = await mintOnce()
-    logActivity(
-      `[${new Date().toISOString()}] PAIR-MINT kicked (${reason}) -> ${JSON.stringify(r).slice(0, 200)}`,
-    )
-  })()
-}
-
-// Full rescue chain: the free-tier allowance is bound to BOTH legs of the
-// identity Ã¢â‚¬â€ the WARP egress (IP bucket, usque tunnel) and the opencode
-// session<->project pair. Rotating only one leg often still 429s, so on real
-// throttling we do both, in order, in the background:
+// ---- the reset: the cure for a 429 ----------------------------------------
+// The free-tier allowance is bound to BOTH legs of the identity - the WARP
+// egress (the IP bucket) and the opencode session<->project pair. Rotating
+// only one leg often still 429s, so a reset does both, in order:
 //   1. warp-rotate.sh --restart-only  (restart the tunnel on the CURRENT
 //      registration: the free bucket is keyed on the EXIT IP, and a restart
 //      hands out a new one without a re-enrollment; --rotate-only is the
 //      fallback when the restart does not bring the tunnel back;
 //      flock-serialized across instances; restores the previous registration
 //      if re-registering fails, so the tunnel never stays down)
-//   2. harvest-session.py --mint     (fresh pair, registered over the new
-//      egress so the gateway's session->project binding sticks)
-let rescueInFlight = false
-let lastRescueAt = 0
+//   2. mint a fresh session/project pair (registered over the new egress so
+//      the gateway's session->project binding sticks)
+//
+// Two things changed when the reset became the answer to a 429 (Nov 13 2026):
+//
+//   - it is AWAITABLE. The request that hit the 429 waits for the fresh
+//     identity and then retries the SAME model. Measured here: a reset lands
+//     in 14-22 s, so the caller gets an answer from the model it asked for.
+//   - it FORCES the mint. The 10-minute mint cooldown used to skip the
+//     pair-mint leg of most resets ({"ok":false,"skipped":"cooldown"}), which
+//     left the drained identity in place - the reset rotated the egress and
+//     then did nothing about the half of the identity that actually holds
+//     the window. A reset exists to get a fresh bucket; the cooldown must
+//     not stand in the way of it.
+type ResetResult = {
+  ok: boolean
+  session: string
+  note: string
+}
+
+let resetInFlight: Promise<ResetResult> | null = null
+let lastResetAt = 0
+
+// A reset is expensive (it spawns a real opencode run), so a storm of 429s
+// shares ONE reset instead of starting one each.
+const RESET_COOLDOWN_MS = Number(env("RELAY_RESET_COOLDOWN_MS") ?? 20_000)
 
 /**
  * Experiment switch: allow the rescue chain to skip the WARP egress rotation
@@ -618,7 +644,7 @@ let lastRescueAt = 0
  * VERDICT.md: "does pair-mint alone recover from a drained bucket, or is the
  * egress leg load-bearing?"). Disable with
  *   SAJILO_RELAY_EGRESS_ROTATE=0   (env)
- *   /tmp/sajilo/relay-no-egress-rotate.txt  (file, live-reloadable Ã¢â‚¬â€ the
+ *   /tmp/sajilo/relay-no-egress-rotate.txt  (file, live-reloadable - the
  *                                              server process env can't be
  *                                              changed without a restart)
  */
@@ -632,14 +658,14 @@ function egressRotationEnabled(): boolean {
   return env("RELAY_EGRESS_ROTATE") !== "0"
 }
 
-function kickRescue(reason: string): boolean {
-  if (env("RELAY_AUTOMINT") === "0") return false
-  const now = Date.now()
-  if (rescueInFlight || now - lastRescueAt < 5 * 60_000) return false
-  rescueInFlight = true
-  lastRescueAt = now
+/**
+ * Do the reset: rotate the egress, then mint a fresh session/project pair.
+ * Never rejects - a failed reset is a result, not an exception.
+ */
+async function performReset(reason: string): Promise<ResetResult> {
+  const before = sessionID()
   const rotateEgress = egressRotationEnabled()
-  // The rotator and the rescue log are per-instance: the sajilo instance must
+  // The rotator and the reset log are per-instance: the sajilo instance must
   // rotate ITS OWN tunnel. A hardcoded path meant sajilo's rescue chain
   // rotated the LIVE tunnel.
   //
@@ -661,67 +687,149 @@ function kickRescue(reason: string): boolean {
     }
   }
   transcript(
-    `--- rescue ${new Date().toISOString()} (${reason}) egress-rotate=${rotateEgress} ---`,
+    `--- reset ${new Date().toISOString()} (${reason}) egress-rotate=${rotateEgress} ---`,
   )
 
-  // The rescue runs natively here - no shell, no quoting, no curl: it is two
+  // The reset runs natively here - no shell, no quoting, no curl: it is two
   // steps, and this process can do both itself. The old version shelled out to
   // a script, which on Windows meant cmd.exe quoting hell: it failed
   // instantly and never wrote a transcript.
-  void (async () => {
-    try {
-      if (rotateEgress) {
-        // Rotate the egress: a new exit IP is a new quota bucket. Restart
-        // first on unix (cheap, keeps the working account); Windows has only
-        // --rotate-only, which replaces the WARP registration.
-        const attempts = isWindows
-          ? [[ROTATOR, "--rotate-only"]]
-          : [
-              [ROTATOR, "--restart-only"],
-              [ROTATOR, "--rotate-only"],
-            ]
-        for (const attempt of attempts) {
-          const [bin, ...args] = attempt
-          const proc = Bun.spawn(
-            isWindows ? ["cmd.exe", "/c", bin, ...args] : ["bash", bin, ...args],
-            { stdout: "pipe", stderr: "pipe", stdin: "ignore" },
-          )
-          const out = await proc.exited
-          let tail = ""
-          try {
-            tail = (await new Response(proc.stdout).text()).slice(-400)
-          } catch {
-            /* ignore */
-          }
-          transcript(`${bin} ${args.join(" ")} -> rc=${out} ${tail.trim()}`)
-          if (out === 0) break
+  try {
+    if (rotateEgress) {
+      // Rotate the egress: a new exit IP is a new quota bucket. Restart
+      // first on unix (cheap, keeps the working account); Windows has only
+      // --rotate-only, which replaces the WARP registration.
+      const attempts = isWindows
+        ? [[ROTATOR, "--rotate-only"]]
+        : [
+            [ROTATOR, "--restart-only"],
+            [ROTATOR, "--rotate-only"],
+          ]
+      for (const attempt of attempts) {
+        const [bin, ...args] = attempt
+        const proc = Bun.spawn(
+          isWindows ? ["cmd.exe", "/c", bin, ...args] : ["bash", bin, ...args],
+          { stdout: "pipe", stderr: "pipe", stdin: "ignore" },
+        )
+        const out = await proc.exited
+        let tail = ""
+        try {
+          tail = (await new Response(proc.stdout).text()).slice(-400)
+        } catch {
+          /* ignore */
         }
-      } else {
-        transcript("egress rotation SKIPPED (experiment mode: pair-mint only)")
+        transcript(`${bin} ${args.join(" ")} -> rc=${out} ${tail.trim()}`)
+        if (out === 0) break
       }
-
-      // Mint a fresh session/project pair through the relay's own endpoint.
-      const minted = await fetch(`http://127.0.0.1:${PORT}/relay-mint`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: "{}",
-      })
-      const body = await minted.text()
-      transcript(`mint -> ${minted.status} ${body.slice(0, 300)}`)
-      logActivity(
-        `[${new Date().toISOString()}] RESCUE finished (${reason}): the egress was rotated and a fresh pair was minted`,
-      )
-    } catch (e) {
-      transcript(`rescue failed: ${String(e).slice(0, 300)}`)
-    } finally {
-      rescueInFlight = false
+    } else {
+      transcript("egress rotation SKIPPED (experiment mode: pair-mint only)")
     }
-  })()
+
+    // Mint a fresh pair. FORCED: the whole point of a reset is a fresh quota
+    // bucket, so the mint cooldown must not skip it.
+    const minted = await mintOnce(undefined, true)
+    transcript(`mint -> ${JSON.stringify(minted).slice(0, 300)}`)
+    // A mint that was already running returns {"skipped":"in-flight"} - wait
+    // for it to land, because that mint IS the reset.
+    if ((minted as { skipped?: string }).skipped === "in-flight") {
+      for (let i = 0; i < 60 && sessionID() === before; i++) {
+        await Bun.sleep(1_000)
+      }
+      transcript(`waited for the in-flight mint -> session ${sessionID()}`)
+    }
+    const after = sessionID()
+    const changed = after !== before && !!after
+    logActivity(
+      `[${new Date().toISOString()}] RESET ${changed ? "landed" : "did NOT change the identity"} (${reason}): ` +
+        `session ${before} -> ${after}`,
+    )
+    return {
+      ok: changed,
+      session: after,
+      note: changed
+        ? "fresh identity"
+        : `the mint did not change the identity (${JSON.stringify(minted).slice(0, 160)})`,
+    }
+  } catch (e) {
+    transcript(`reset failed: ${String(e).slice(0, 300)}`)
+    return { ok: false, session: sessionID(), note: String(e).slice(0, 300) }
+  }
+}
+
+/**
+ * Start a reset, or join the one that is already running. The promise
+ * settles when the fresh identity is in place - the caller then retries the
+ * SAME model against it.
+ */
+function startReset(reason: string): Promise<ResetResult> {
+  if (env("RELAY_AUTOMINT") === "0") {
+    return Promise.resolve({
+      ok: false,
+      session: sessionID(),
+      note: "disabled (SAJILO_RELAY_AUTOMINT=0)",
+    })
+  }
+  // Share the reset that is already running: a storm of 429s must not spawn
+  // one opencode run each.
+  if (resetInFlight) return resetInFlight
+  if (Date.now() - lastResetAt < RESET_COOLDOWN_MS) {
+    // A reset landed just now, so the identity is already fresh - but the
+    // window may still be empty. Say so instead of spawning another
+    // opencode run.
+    return Promise.resolve({
+      ok: false,
+      session: sessionID(),
+      note: "a reset landed just now - the identity is fresh, the window may not be",
+    })
+  }
+  lastResetAt = Date.now()
+  const p = performReset(reason)
+  resetInFlight = p
+  p.finally(() => {
+    if (resetInFlight === p) resetInFlight = null
+  }).catch(() => {
+    /* performReset never rejects, but never leave a dangling rejection */
+  })
   logActivity(
-    `[${new Date().toISOString()}] RESCUE kicked (${reason}): ` +
-      `${rotateEgress ? "warp rotate + pair re-mint" : "pair re-mint only (egress rotation disabled)"}`,
+    `[${new Date().toISOString()}] RESET kicked (${reason}): ` +
+      `${egressRotationEnabled() ? "warp rotate + pair re-mint" : "pair re-mint only (egress rotation disabled)"}`,
   )
-  return true
+  return p
+}
+
+/**
+ * Is this 429 a drained quota, or a rejected request shape? They look the
+ * same from the outside (the doctor tells them apart), but they need
+ * opposite cures: a drained window is fixed by a reset, a rejected shape is
+ * fixed by changing the harness - and resetting forever would bury the real
+ * error instead of reporting it.
+ */
+function isQuotaError(body: string): boolean {
+  const b = (body ?? "").toLowerCase()
+  if (!b.trim()) return true // no body: assume the window
+  return (
+    b.includes("freeusagelimit") ||
+    b.includes("free usage limit") ||
+    b.includes("usage limit reached")
+  )
+}
+
+/**
+ * Seconds until the window refills, from the 429's Retry-After header (the
+ * gateway sends it - that is where "unblocks: 2026-11-14 00:13:02 UTC" in
+ * the warp probe comes from). It is the difference between "wait 13 hours"
+ * and "reset the identity now", so it decides the cure.
+ */
+function retryAfterSeconds(value: string | null): number {
+  if (!value) return 0
+  const raw = value.trim()
+  const n = Number(raw)
+  if (Number.isFinite(n) && n > 0) return n
+  const when = Date.parse(raw)
+  if (Number.isFinite(when)) {
+    return Math.max(0, Math.round((when - Date.now()) / 1000))
+  }
+  return 0
 }
 
 // ---- egress mode ----------------------------------------------------------
@@ -761,7 +869,7 @@ function withHost(list: string, host: string): string {
 /**
  * fetch() with an optional proxy bypass. Bun reads NO_PROXY when the request
  * is issued, so the env is patched around the synchronous call and restored
- * right after Ã¢â‚¬â€ the tunnel stays the default for everything else in the
+ * right after - the tunnel stays the default for everything else in the
  * process.
  *
  * forceDirect=true bypasses the proxy even when the direct-egress flag is
@@ -835,10 +943,38 @@ async function fetchWithLadder(
 
 const RETRYABLE_STATUS = (s: number) => s === 429 || s >= 500 || s === 402
 
+// The relay's server, in a place that survives a plugin RELOAD.
+//
+// When the plugin file changes, opencode loads a fresh copy of this module in
+// the same process. The old module still owns the port; the new one finds it
+// healthy, adopts it as a stand-by - and then the old module's cleanup
+// stops the server. Nothing is serving any more: the relay goes down until
+// the process is restarted. That is why updating the plugin used to look
+// like "the relay died".
+//
+// A process-global registry lets the new instance find the old server and
+// hand the port over cleanly.
+const RELAY_REGISTRY = ((globalThis as any).__sajiloRelay ??= {
+  server: null as unknown,
+  ownerPid: 0,
+})
+
+function takeOverOwnServer(): void {
+  const old = RELAY_REGISTRY.server
+  if (!old) return
+  try {
+    old.stop(true)
+  } catch {
+    /* the old one may already be gone */
+  }
+  RELAY_REGISTRY.server = null
+  RELAY_REGISTRY.ownerPid = 0
+}
+
 // A rotation is in flight: the rotator writes this marker while it replaces
 // the tunnel. During that window every in-flight request fails with
 // ECONNREFUSED, which used to look like "the egress is broken" and made the
-// relay kick ANOTHER rotation Ã¢â‚¬â€ rotating the tunnel out from under the
+// relay kick ANOTHER rotation - rotating the tunnel out from under the
 // rotator, in a loop. Respect the marker: don't count those errors, and
 // don't kick a rescue while a rotation is running.
 // (the per-instance marker is defined at the top of this file)
@@ -932,16 +1068,23 @@ async function mintOnce(prompt?: string, force = false): Promise<Record<string, 
       if (k === "OPENCODE_SESSION_ID" || v === undefined) continue
       env[k] = v
     }
+    // The minted child must NOT run a relay of its own. It loads the same
+    // plugin, finds the port already served, and adopts it as a stand-by -
+    // which then takes the port over when the parent goes away, and takes the
+    // relay down with it in the meantime. The child only needs to create one
+    // session.
+    env.SAJILO_RELAY_ENABLED = "0"
+    env.OPENCODE_BUN_RELAY = "0"
     // The opencode CLI resolves the project directory from PWD, not from the
     // child's cwd. The server process exports PWD=<harness project> (here
     // /sdcard/Yoyo), so an inherited PWD makes the child create its session in
-    // the harness project Ã¢â‚¬â€ where the harvester refuses to look. Point PWD at
+    // the harness project - where the harvester refuses to look. Point PWD at
     // the scratch dir so the minted session lands in its own project.
     env.PWD = dir
     env.OLDPWD = dir
     // --standalone is mandatory: without it `opencode run` attaches to the
     // app's background service, so the new session is created in the SERVICE's
-    // project dir (/sdcard/Yoyo) instead of the scratch dir Ã¢â‚¬â€ and the
+    // project dir (/sdcard/Yoyo) instead of the scratch dir - and the
     // harvester filters that dir out, so the mint could never find its own
     // session. With --standalone the child runs its own server rooted at the
     // scratch dir, so the session id + project id are a fresh, eligible pair.
@@ -1050,8 +1193,8 @@ let watchdogTimer: ReturnType<typeof setInterval> | null = null
 
 /**
  * Stand-by takeover. This process adopted the port because another opencode
- * process owned it. If that owner goes away Ã¢â‚¬â€ its plugin is reloaded, its
- * session ends Ã¢â‚¬â€ nobody would be serving the relay any more, because the
+ * process owned it. If that owner goes away - its plugin is reloaded, its
+ * session ends - nobody would be serving the relay any more, because the
  * adopted server died with its owner. So stand by and take the port over the
  * moment it frees up: the relay must never stay down.
  */
@@ -1073,7 +1216,7 @@ function startTakeover(): void {
         takeoverTimer = null
       }
     } catch {
-      /* the port is still busy Ã¢â‚¬â€ try again on the next tick */
+      /* the port is still busy - try again on the next tick */
     }
   }, 750)
   takeoverTimer.unref?.()
@@ -1089,6 +1232,13 @@ let server: ReturnType<typeof Bun.serve> | null = null
 // the new instance adopted the old server, the old server was then stopped by
 // its cleanup, and nothing was left serving.
 function startServer(): void {
+      // A previous copy of this module in THIS process may still own the port
+      // (the plugin was reloaded). Take it over instead of adopting it: the
+      // old instance's cleanup would otherwise stop the very server we are
+      // standing by for, and the relay would go down with nothing serving.
+      if (RELAY_REGISTRY.ownerPid === process.pid) {
+        takeOverOwnServer()
+      }
       server = Bun.serve({
         port: PORT,
         hostname: BIND,
@@ -1138,13 +1288,20 @@ function startServer(): void {
         }
         if (req.method === "POST" && url.pathname === "/relay-mint") {
           let prompt: string | undefined
+          let force = false
+          // ?force=1 is the shell-safe way to ask for a mint: a JSON body
+          // with quotes in it is a quoting nightmare in cmd.exe.
+          if (url.searchParams.get("force") === "1") force = true
           try {
-            const b = (await req.json()) as { prompt?: string }
+            const b = (await req.json()) as { prompt?: string; force?: boolean }
             if (typeof b?.prompt === "string") prompt = b.prompt
+            // force=true skips the mint cooldown: the caller wants a fresh
+            // identity NOW (a reset of the limit, or a manual `sajilo mint`).
+            if (b?.force === true) force = true
           } catch {
             /* empty body is fine */
           }
-          return Response.json(await mintOnce(prompt))
+          return Response.json(await mintOnce(prompt, force))
         }
         // Two ways in, so any OpenAI-compatible client works out of the box:
         //   /openai/v1/...  the canonical path
@@ -1195,10 +1352,16 @@ function startServer(): void {
 
         let body: ReadableStream<Uint8Array> | null = req.body
         let transformed = ""
+        // The caller's own body, kept for the checks that need it (the
+        // Freebuff model-override probe). It used to be scoped to the block
+        // below, so the check silently threw a ReferenceError into its own
+        // catch and the override never applied.
+        let rawBody = ""
         const isChat =
           url.pathname.endsWith("/chat/completions") && req.method === "POST"
         if (isChat) {
           const raw = await req.text()
+          rawBody = raw
           let wantStream = true
           try {
             wantStream = (JSON.parse(raw) as { stream?: boolean }).stream !== false
@@ -1259,6 +1422,13 @@ function startServer(): void {
         // rotation. Only for chat/completions; everything else stays 1:1.
         let upstream: Response | null = null
         let servedModel = ""
+        // The model the caller asked for. It never changes, so it is also
+        // what the error path reports when the spin gives up.
+        let requestedModel = ""
+        // Seconds until the window refills, as the gateway said. The error
+        // path hands it to the caller as its Retry-After, so a retry lands
+        // exactly when the quota is back.
+        let lastRefillIn = 0
         let finalStatus = 0
         let finalErrBody = "<no response>"
         if (isChat) {
@@ -1270,12 +1440,12 @@ function startServer(): void {
           // user picked in the TUI (/model) - so THAT wins here, and the relay
           // follows the harness automatically. Only when the request carries
           // no model at all do the pin file and then the default apply.
-          let originModel: string | null = null
+          let originModel = ""
           try {
             const m = (JSON.parse(transformed) as { model?: string }).model
             if (typeof m === "string" && m) originModel = m
           } catch {
-            /* not JSON Ã¢â‚¬â€ fall through to the pin/default */
+            /* not JSON - fall through to the pin/default */
           }
           if (!originModel) {
             const pinned = modelPin()
@@ -1299,178 +1469,244 @@ function startServer(): void {
               env("RELAY_MODEL_FILE") ?? "/tmp/sajilo/relay-model-override.txt",
               "utf8",
             ).trim()
-            if (ov && raw.includes("You are Buffy")) {
+            if (ov && rawBody.includes("You are Buffy")) {
               originModel = ov
               logActivity(`[${new Date().toISOString()}] MODEL-OVERRIDE ${ov} (Freebuff /model pick)`)
             }
           } catch {
-            /* no override file Ã¢â‚¬â€ ignore */
+            /* no override file - ignore */
           }
-          const pool = modelPool(originModel)
-          const CYCLE_WAIT = [0, 20_000, 60_000]
-          // Total budget for the whole spin. Without it a fully-drained
-          // account (every model 429 on every egress) kept the caller waiting
-          // ~5 minutes: 11 models x 3 cycles of slow 429s plus the 20 s + 60 s
-          // backoffs. A caller (Freebuff, a CLI, a UI) must never be parked
-          // that long Ã¢â‚¬â€ after the budget we answer with the last error and
-          // the client retries when it wants to.
-          const SPIN_BUDGET_MS = Number(env("RELAY_SPIN_BUDGET_MS") ?? 45_000)
+          // The model the caller asked for. It NEVER changes: a 429 is a
+          // drained window, not a bad model, so the answer is a reset of the
+          // identity, not a different model.
+          const wanted = originModel
+          requestedModel = wanted
+          // How long the relay is willing to keep working on ONE request.
+          //
+          // The old spin gave up after 45 s and handed the caller the
+          // gateway's own 429 - which is exactly what the end user must
+          // never see. The relay now keeps working (waiting out the refill,
+          // resetting the identity, rotating the egress) for as long as the
+          // client stays connected, and only answers a retryable 503 if the
+          // client is still there after the ceiling. In practice the reset
+          // recovers the window in 14-22 s, so the answer is a slow one, not
+          // an error.
+          const SPIN_BUDGET_MS = Number(env("RELAY_SPIN_BUDGET_MS") ?? 150_000)
+          // A safety valve, not a policy: 0 = unlimited (the ceiling above is
+          // the only limit). Each reset spawns a real opencode run and
+          // rotates the tunnel, so this only exists to stop a pathological
+          // loop.
+          const MAX_RESETS = Number(env("RELAY_MAX_RESETS") ?? 4)
+          // The longest refill the relay is willing to WAIT for instead of
+          // resetting the identity. Past that, waiting beats resetting (the
+          // window is a rolling one), and the gateway's Retry-After goes
+          // to the caller so its retry is timed right.
+          const WAIT_MAX_SECONDS = Number(env("RELAY_WAIT_MAX_SECONDS") ?? 45)
           const spinStarted = Date.now()
           let fetchErrors = 0
-          let fatalCount = 0
-          outer: for (let cycle = 0; cycle < CYCLE_WAIT.length; cycle++) {
-            if (cycle > 0) {
-              if (finalStatus === 429) {
-                // Whole pool said 429: the identity (egress + pair) is the
-                // bottleneck. Full rescue chain in the background; this and
-                // later attempts re-read the fresh pins when they land.
-                kickRescue("all-pool-429")
-              }
-              // Never sleep past the budget: the backoff itself was adding up
-              // to a minute on top of it (45 s budget, 116 s observed).
-              const remaining = SPIN_BUDGET_MS - (Date.now() - spinStarted)
-              if (remaining <= 0) {
+          let resets = 0
+          outer: while (true) {
+            if (Date.now() - spinStarted > SPIN_BUDGET_MS) {
+              // A reset that is still landing would give this request a fresh
+              // identity to retry against, so give it a bounded moment - but
+              // not an open-ended wait.
+              if (resetInFlight && Date.now() - spinStarted < SPIN_BUDGET_MS + 30_000) {
                 logActivity(
-                  `[${new Date().toISOString()}] SPIN budget exhausted (${SPIN_BUDGET_MS}ms) before cycle ${cycle} Ã¢â‚¬â€ answering with the last error`,
+                  `[${new Date().toISOString()}] SPIN budget exhausted while a reset is in flight - waiting for it`,
                 )
-                break outer
+                await Bun.sleep(5_000)
+                continue
               }
-              const wait = Math.min(CYCLE_WAIT[cycle], remaining)
               logActivity(
-                `[${new Date().toISOString()}] SPIN cycle ${cycle} (all ${pool.length} models exhausted) Ã¢â‚¬â€ waiting ${wait / 1000}s`,
+                `[${new Date().toISOString()}] SPIN budget exhausted (${SPIN_BUDGET_MS}ms) after ${resets} reset(s) - answering with a retryable 503`,
               )
-              await Bun.sleep(wait)
+              break outer
             }
-            for (const m of pool) {
-              if (Date.now() - spinStarted > SPIN_BUDGET_MS) {
-                // If the rescue chain is mid-rotation, the next cycle will hit
-                // a FRESH exit IP (the quota is keyed on the exit IP) and
-                // therefore a fresh bucket. Giving up now would throw the
-                // request away at the exact moment the fix is landing.
+            const attemptBody = setModel(applyModelIdentity(transformed, wanted), wanted)
+            let resp: Response | null = null
+            // Egress ladder: the proxied path first, then the device's native
+            // egress. A dead proxy (usque down, port drifted, rotation in
+            // flight) must not kill the request - the native egress is an
+            // independent quota bucket and can still serve it.
+            for (const egress of egressLadder()) {
+              try {
+                resp = await fetchUpstream(
+                  target,
+                  {
+                    method: "POST",
+                    headers: buildHeaders(),
+                    // @ts-expect-error bun fetch allows string body
+                    body: attemptBody,
+                    // @ts-expect-error bun extension: keep the SSE pipe alive
+                    duplex: "half",
+                  },
+                  egress === "direct",
+                )
+                // A 429 from the proxied leg means THAT BUCKET is drained -
+                // not that the model is. The native egress is a different
+                // bucket (its own exit IP) and can still have room, so keep
+                // climbing the ladder instead of answering the 429.
+                if (resp.status === 429 && egress === "proxy" && egressLadder().length > 1) {
+                  logActivity(
+                    `[${new Date().toISOString()}] SPIN 429 via the proxied egress (${wanted}): that bucket is drained - trying the native egress`,
+                  )
+                  try {
+                    await resp.body?.cancel()
+                  } catch {
+                    /* ignore */
+                  }
+                  resp = null
+                  continue
+                }
+                break
+              } catch (e) {
+                finalStatus = 0
+                finalErrBody = String(e).slice(0, 300)
+                if (egress === "proxy") {
+                  // The proxy leg failed - fall through to the direct leg.
+                  logActivity(
+                    `[${new Date().toISOString()}] SPIN fetch-error via proxy (${wanted}): ${finalErrBody} - trying the native egress`,
+                  )
+                  continue
+                }
+                // Both legs failed for this attempt.
+                fetchErrors++
                 if (rotationInProgress()) {
                   logActivity(
-                    `[${new Date().toISOString()}] SPIN budget reached while a rotation is in flight Ã¢â‚¬â€ waiting for it`,
+                    `[${new Date().toISOString()}] SPIN fetch-error during a known rotation (${wanted}): not counting it`,
                   )
-                  await Bun.sleep(10_000)
+                  fetchErrors = 0
                   continue
                 }
                 logActivity(
-                  `[${new Date().toISOString()}] SPIN budget exhausted (${SPIN_BUDGET_MS}ms) Ã¢â‚¬â€ answering with the last error`,
+                  `[${new Date().toISOString()}] SPIN fetch-error on every egress (${wanted}): ${finalErrBody}`,
                 )
-                break outer
-              }
-              const attemptBody = setModel(applyModelIdentity(transformed, m), m)
-              let resp: Response | null = null
-              // Egress ladder per model: proxied path first, then the
-              // device's native egress. A dead proxy (usque down, port
-              // drifted, rotation in flight) must not kill the request Ã¢â‚¬â€ the
-              // native egress is an independent quota bucket and can still
-              // serve it.
-              for (const egress of egressLadder()) {
-                try {
-                  resp = await fetchUpstream(
-                    target,
-                    {
-                      method: "POST",
-                      headers: buildHeaders(),
-                      // @ts-expect-error bun fetch allows string body
-                      body: attemptBody,
-                      // @ts-expect-error bun extension: keep the SSE pipe alive
-                      duplex: "half",
-                    },
-                    egress === "direct",
-                  )
-                  // A 429 from the proxied leg means THAT BUCKET is drained -
-                  // not that the model is. The native egress is a different
-                  // bucket (its own exit IP) and can still have room, so keep
-                  // climbing the ladder instead of answering the 429.
-                  if (resp.status === 429 && egress === "proxy" && egressLadder().length > 1) {
-                    logActivity(
-                      `[${new Date().toISOString()}] SPIN 429 via the proxied egress (${m}): that bucket is drained - trying the native egress`,
-                    )
-                    try {
-                      await resp.body?.cancel()
-                    } catch {
-                      /* ignore */
-                    }
-                    resp = null
-                    continue
-                  }
-                  break
-                } catch (e) {
-                  finalStatus = 0
-                  finalErrBody = String(e).slice(0, 300)
-                  if (egress === "proxy") {
-                    // The proxy leg failed Ã¢â‚¬â€ fall through to the direct leg.
-                    logActivity(
-                      `[${new Date().toISOString()}] SPIN fetch-error via proxy (${m}): ${finalErrBody} Ã¢â‚¬â€ trying the native egress`,
-                    )
-                    continue
-                  }
-                  // Both legs failed for this model.
-                  fetchErrors++
-                  if (rotationInProgress()) {
-                    logActivity(
-                      `[${new Date().toISOString()}] SPIN fetch-error during a known rotation (${m}): not counting it`,
-                    )
-                    fetchErrors = 0
-                    continue
-                  }
+                if (fetchErrors >= 3) {
+                  // Every egress is unreachable. The reset repairs the egress
+                  // in the background; the client retries.
                   logActivity(
-                    `[${new Date().toISOString()}] SPIN fetch-error on every egress (${m}): ${finalErrBody}`,
+                    `[${new Date().toISOString()}] SPIN aborting: every egress unreachable after ${fetchErrors} fetch errors`,
                   )
-                  if (fetchErrors >= 3) {
-                    // Every egress is unreachable. Do not wait out the
-                    // 20 s + 60 s cycles Ã¢â‚¬â€ nothing can succeed while the
-                    // network is down, and the caller hangs for ~85 s.
-                    // The rescue chain repairs the egress in the background;
-                    // the client's retry is faster than our wait.
-                    logActivity(
-                      `[${new Date().toISOString()}] SPIN aborting: every egress unreachable after ${fetchErrors} fetch errors`,
-                    )
-                    kickRescue("egress-unreachable")
-                    break outer
-                  }
+                  void startReset("egress-unreachable")
+                  break outer
                 }
               }
-              if (!resp) continue
-              if (resp.status === 200) {
-                upstream = resp
-                servedModel = m
-                if (m !== originModel) {
-                  logActivity(
-                    `[${new Date().toISOString()}] SPIN fallback used: ${originModel} -> ${m}`,
-                  )
-                }
-                // Say plainly which model answered. The relay rotates under the
-                // hood, so the model the client asked for is not always the one
-                // that replied - and "which model was that?" is the first
-                // question anyone asks when the answers feel different.
-                logActivity(
-                  `[${new Date().toISOString()}] SERVED ${m}` +
-                    `${m === originModel ? " (as requested)" : ` (rotated from ${originModel})`}`,
-                )
-                break outer
-              }
-              const errBody = await resp.text().catch(() => "<unreadable>")
-              finalStatus = resp.status
-              finalErrBody = errBody
-              logActivity(
-                `[${new Date().toISOString()}] SPIN ${resp.status} on ${m} (of ${pool.length}): ${errBody.slice(0, 200)}`,
-              )
-              if (RETRYABLE_STATUS(resp.status)) continue
-              // Not retryable (e.g. 400 fingerprint error): the request shape
-              // is what the gateway disliked, so trying every model and
-              // every cycle only burns the caller's time (one malformed body
-              // used to cost the full 80 s of backoff and then time out on
-              // the client). Give it ONE more model in case the complaint is
-              // model-specific, then stop and report the real error.
-              fatalCount++
-              logActivity(
-                `[${new Date().toISOString()}] SPIN ${resp.status} is not retryable (${fatalCount}/2) Ã¢â‚¬â€ ${fatalCount >= 2 ? "giving up on this body" : "trying one more model"}`,
-              )
-              if (fatalCount >= 2) break outer
             }
+            if (!resp) continue
+            if (resp.status === 200) {
+              upstream = resp
+              servedModel = wanted
+              // Say plainly which model answered. The relay does NOT rotate
+              // models: a drained window is fixed with a fresh identity, so
+              // this is always the model the caller asked for.
+              logActivity(
+                `[${new Date().toISOString()}] SERVED ${wanted} (as requested)`,
+              )
+              break outer
+            }
+            const errBody = await resp.text().catch(() => "<unreadable>")
+            finalStatus = resp.status
+            finalErrBody = errBody
+            // The gateway says when the window refills (Retry-After). That
+            // is what decides the cure: a window that refills in seconds is
+            // worth waiting out, a window that refills in hours is worth a
+            // fresh identity instead.
+            const retryAfter = resp.headers.get("retry-after")
+            const refillIn = retryAfterSeconds(retryAfter)
+            if (refillIn > 0) lastRefillIn = refillIn
+            logActivity(
+              `[${new Date().toISOString()}] SPIN ${resp.status} on ${wanted}: ${errBody.slice(0, 200)}` +
+                `${refillIn > 0 ? ` (the window refills in ${refillIn}s)` : ""}`,
+            )
+            if (resp.status === 429) {
+              if (!isQuotaError(errBody)) {
+                // Not a drained window: the gateway rejected the request
+                // shape (the doctor tells the two apart). Neither a retry nor
+                // a reset would fix that - they would only bury the real
+                // error, so report it.
+                logActivity(
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted} is NOT a quota error - the gateway rejected the request shape`,
+                )
+                break outer
+              }
+              const remaining = SPIN_BUDGET_MS - (Date.now() - spinStarted)
+              if (remaining <= 0) break outer
+              // The gateway told us when the window refills. If that is soon
+              // enough to fit in what is left of the ceiling, waiting it out
+              // is cheaper AND cleaner than a reset: no tunnel rotation, no
+              // opencode run, and the identity stays the caller's own. A wait
+              // is not a reset, so it does not use the reset budget.
+              //
+              // A far-off refill is waited for too, but only once a reset
+              // has already failed to bring the window back - then the
+              // gateway's own clock is the only thing left to trust.
+              const waitMs = refillIn * 1000
+              const fits = refillIn > 0 && waitMs <= remaining
+              const shortWait = fits && refillIn <= WAIT_MAX_SECONDS
+              if (shortWait) {
+                logActivity(
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window refills in ${refillIn}s - waiting it out (no reset)`,
+                )
+                await Bun.sleep(waitMs)
+                continue
+              }
+              // The window for THIS identity is empty. Reset it - a new egress
+              // and a new session/project pair - and retry the SAME model
+              // against the fresh identity.
+              if (resets >= MAX_RESETS) {
+                logActivity(
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted} after ${resets} resets - giving up on this request`,
+                )
+                break outer
+              }
+              resets++
+              logActivity(
+                `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window for this identity is empty - resetting the limit (reset ${resets}/${MAX_RESETS})` +
+                  `${refillIn > 0 ? ` (the gateway says this window refills in ${refillIn}s)` : ""}`,
+              )
+              // Wait for the reset, but never past the ceiling: a reset that
+              // lands after the ceiling still helps the NEXT request.
+              const raced = await Promise.race([
+                startReset(`429-${wanted}`).then((reset) => ({ timedOut: false, reset })),
+                Bun.sleep(Math.max(0, remaining)).then(() => ({
+                  timedOut: true,
+                  reset: null as ResetResult | null,
+                })),
+              ])
+              if (raced.timedOut) {
+                logActivity(
+                  `[${new Date().toISOString()}] SPIN budget exhausted while the reset was landing - answering with a retryable 503`,
+                )
+                break outer
+              }
+              if (!raced.reset?.ok) {
+                // The reset did not change the identity (it was skipped, or
+                // the mint failed). Back off instead of hammering a drained
+                // window - the next attempt still costs the caller nothing
+                // but time.
+                logActivity(
+                  `[${new Date().toISOString()}] RESET did not land (${raced.reset?.note ?? "unknown"}) - waiting 3s and retrying ${wanted}`,
+                )
+                await Bun.sleep(3_000)
+              }
+              continue
+            }
+            if (RETRYABLE_STATUS(resp.status)) {
+              // 5xx / 402: a transient server-side problem. Back off a moment
+              // and retry the SAME model - the model is not the problem, and
+              // the caller's request shape is unchanged.
+              const remaining = SPIN_BUDGET_MS - (Date.now() - spinStarted)
+              if (remaining <= 0) break outer
+              await Bun.sleep(Math.min(2_000, remaining))
+              continue
+            }
+            // Not retryable (e.g. 400 fingerprint error): the request shape is
+            // what the gateway disliked, and the very same request against the
+            // very same model would fail the very same way. Report it.
+            logActivity(
+              `[${new Date().toISOString()}] SPIN ${resp.status} is not retryable - giving up on this body: ${errBody.slice(0, 200)}`,
+            )
+            break outer
           }
         } else {
           try {
@@ -1515,8 +1751,38 @@ function startServer(): void {
             logActivity(
               `[${new Date().toISOString()}] UPSTREAM-ERROR-BODY ${finalStatus}: ${finalErrBody.slice(0, 1200)}`,
             )
+            const status = upstream?.status ?? (finalStatus || 502)
+            // A rate-limit error must never reach the end user. The relay
+            // resets the limit instead of passing a 429 on, so by the time one
+            // gets here the spin has already tried to fix it. Answer 503 with
+            // a Retry-After: it is not a quota error, and the opencode runtime
+            // retries a 5xx on its own - so the caller sees a slow answer, not
+            // "Free usage limit reached".
+            if (status === 429) {
+              const headers = new Headers(respHeaders)
+              headers.set("content-type", "application/json")
+              // The gateway told us when the window refills. Hand that to the
+              // caller as its Retry-After, so the retry lands exactly when
+              // the quota is back instead of hammering the gate.
+              const retryIn = lastRefillIn > 0 ? Math.min(lastRefillIn, 3600) : 5
+              headers.set("retry-after", String(retryIn))
+              if (requestedModel) headers.set("x-sajilo-model", requestedModel)
+              logActivity(
+                `[${new Date().toISOString()}] ANSWER 503 (the 429 is not passed on: the limit is being reset, and the caller is asked to retry in ${retryIn}s)`,
+              )
+              return new Response(
+                JSON.stringify({
+                  error:
+                    "sajilo-relay: the free window is being re-established - retry when it says",
+                  retry: true,
+                  retryAfterSeconds: retryIn,
+                  model: requestedModel,
+                }),
+                { status: 503, headers },
+              )
+            }
             return new Response(finalErrBody, {
-              status: upstream?.status ?? (finalStatus || 502),
+              status,
               headers: upstream ? respHeaders : { "content-type": "application/json" },
             })
           }
@@ -1751,7 +2017,7 @@ export async function startRelay(): Promise<void> {
     // is lossless: this process just talks to the existing relay as a client.
     //
     // BUT: on a plugin reload the port can still be held by OUR OWN previous
-    // instance (same pid). Adopting it would be a trap Ã¢â‚¬â€ the old server is
+    // instance (same pid). Adopting it would be a trap - the old server is
     // then stopped by its cleanup and nothing is left serving, which is how
     // the relay used to go down (connection refused) after every reload.
     // In that case wait for the old server to release the port and bind.
@@ -1775,7 +2041,7 @@ export async function startRelay(): Promise<void> {
       // opencode's plugin activation has a HARD 5 s budget: if setup() has
       // not resolved by then, every location-scoped API answers 503
       // "Location plugins did not finish activating". So the wait here is
-      // deliberately short Ã¢â‚¬â€ the stand-by takeover (startTakeover) binds the
+      // deliberately short - the stand-by takeover (startTakeover) binds the
       // port as soon as it frees up, without blocking the activation.
       for (let i = 0; i < 5; i++) {
         await Bun.sleep(250)
@@ -1830,7 +2096,7 @@ export async function startRelay(): Promise<void> {
     startWatchdog()
 
 // Proactive tunnel watchdog: probe the WARP egress every few minutes and
-// repair it from a cold start if it is down Ã¢â‚¬â€ independent of traffic, so
+// repair it from a cold start if it is down - independent of traffic, so
 // "start at any point works automatically". Cheap when healthy (probe
 // pass = no-op). The cooldown lives inside the script. Disable with
 // SAJILO_RELAY_WATCHDOG=0.
