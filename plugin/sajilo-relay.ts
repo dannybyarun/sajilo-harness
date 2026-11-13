@@ -1810,6 +1810,9 @@ function startServer(): void {
           let egressRotated = false
           let egressPending: Promise<boolean> | null = null
           let mintPending: Promise<ResetResult> | null = null
+          // Did the identity mint land? Once it has, a further 429 means the
+          // model is empty for the whole account - not for this identity.
+          let mintSettled = false
           outer: while (true) {
             if (Date.now() - spinStarted > KEEP_WORKING_MS) {
               // A reset that is still landing would give this request a fresh
@@ -1945,18 +1948,37 @@ function startServer(): void {
               // opencode run, and the identity stays the caller's own. A wait
               // is not a reset, so it does not use the reset budget.
               //
-              // A far-off refill is waited for too, but only once a reset
-              // has already failed to bring the window back - then the
-              // gateway's own clock is the only thing left to trust.
+              // A far-off refill is waited for too, but only once a reset has
+              // already failed to bring the window back - then the gateway's
+              // own clock is the only thing left to trust.
               const waitMs = refillIn * 1000
               const fits = refillIn > 0 && waitMs <= remaining
               const shortWait = fits && refillIn <= WAIT_MAX_SECONDS
               const longWait =
                 fits &&
                 refillIn > WAIT_MAX_SECONDS &&
-                refillIn <= LONG_WAIT_MAX_SECONDS &&
-                resets > 0
-              if (shortWait || longWait) {
+                refillIn <= LONG_WAIT_MAX_SECONDS
+              if (mintSettled) {
+                // A fresh egress AND a fresh identity did not help: the model
+                // is empty for the WHOLE ACCOUNT, not for this identity, and
+                // no rotation can change that. Spinning for the rest of the
+                // budget would only burn the caller's time - so either wait
+                // for the gateway's own refill (if it is near) or answer with
+                // it, which is the truth.
+                if (longWait) {
+                  logActivity(
+                    `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window refills in ${refillIn}s - waiting it out`,
+                  )
+                  await Bun.sleep(waitMs)
+                  continue
+                }
+                logActivity(
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: a fresh egress and a fresh identity did not help - the model is empty for the whole account` +
+                    `${refillIn > 0 ? ` (it refills in ${refillIn}s)` : ""}. Answering with that time instead of spinning.`,
+                )
+                break outer
+              }
+              if (shortWait) {
                 logActivity(
                   `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window refills in ${refillIn}s - waiting it out (no reset)`,
                 )
@@ -2004,9 +2026,14 @@ function startServer(): void {
                   /* performEgressRotation never rejects */
                 })
                 mintPending = mintIdentity(`429-${wanted}`)
-                mintPending.catch(() => {
-                  /* performMint never rejects */
-                })
+                mintPending.then(
+                  () => {
+                    mintSettled = true
+                  },
+                  () => {
+                    mintSettled = true
+                  },
+                )
                 continue
               }
               // The egress had its chance (and the rotation may have landed

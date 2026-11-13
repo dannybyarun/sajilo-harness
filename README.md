@@ -346,6 +346,15 @@ Waiting for the identity *first* was the bug that made a long session fail
 while a fresh one worked: the reset ate the whole budget, and the caller got
 the 503 before the fix it had asked for had landed.
 
+There are **two kinds** of exhaustion, and the relay tells them apart:
+
+- **this identity's window** - the usual one. A reset fixes it, and the
+  request is answered from the same model in seconds to a minute.
+- **the whole account's allowance** - the gateway says the window refills in
+  hours (measured: 62345 s). No rotation can change that, so after one reset
+  cycle the relay stops spinning and answers with the gateway's own refill
+  time instead of burning the caller's time.
+
 The caller never sees a rate-limit error. If the client is still there when
 the ceiling is reached, the relay answers **503** with the gateway's own
 `Retry-After` - a retryable status that is not a quota error - and the reset
