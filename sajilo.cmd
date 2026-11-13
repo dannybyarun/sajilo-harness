@@ -117,6 +117,13 @@ REM different quota bucket, which is what the ladder climbs to. Bun < 1.4
 REM ignores NO_PROXY, so this is the only way out of the tunnel on Windows.
 REM The relay starts the shim itself if it is not running yet.
 if "%SAJILO_RELAY_DIRECT_PROXY%"=="" set "SAJILO_RELAY_DIRECT_PROXY=http://127.0.0.1:40001"
+REM What the relay will actually use, written down so `sajilo doctor` (which
+REM runs in a plain shell, with none of this env) can report the real legs
+REM instead of guessing.
+> "%STATE%\relay-env.txt" (
+  echo SAJILO_RELAY_PROXY=%SAJILO_RELAY_PROXY%
+  echo SAJILO_RELAY_DIRECT_PROXY=%SAJILO_RELAY_DIRECT_PROXY%
+)
 set "OPENCODE_RELAY_PROXY="
 set "NO_PROXY=127.0.0.1,localhost,::1"
 set "no_proxy=127.0.0.1,localhost,::1"

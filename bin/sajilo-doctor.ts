@@ -125,8 +125,28 @@ console.log("\negress")
 // leg" on a machine whose ambient proxy WAS the Cloudflare WARP proxy
 // (warp-svc.exe on 127.0.0.1:40000) - and that answer decides whether the
 // instance has one bucket or two.
+//
+// The launcher writes the relay's effective env to <root>/state/relay-env.txt,
+// so the doctor reports the legs the RELAY uses even when it runs in a plain
+// shell with none of that env.
+const relayEnv: Record<string, string> = (() => {
+  try {
+    const raw = readFileSync(join(STATE, "relay-env.txt"), "utf8")
+    const out: Record<string, string> = {}
+    for (const line of raw.split("\n")) {
+      const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim())
+      if (m) out[m[1]] = m[2].trim()
+    }
+    return out
+  } catch {
+    return {}
+  }
+})()
 const explicitProxy =
-  process.env.SAJILO_RELAY_PROXY ?? process.env.OPENCODE_RELAY_PROXY ?? ""
+  process.env.SAJILO_RELAY_PROXY ??
+  process.env.OPENCODE_RELAY_PROXY ??
+  relayEnv.SAJILO_RELAY_PROXY ??
+  ""
 const ambientProxy =
   process.env.HTTPS_PROXY ??
   process.env.https_proxy ??
@@ -135,7 +155,10 @@ const ambientProxy =
   ""
 const proxy = explicitProxy || ambientProxy
 const directProxy =
-  process.env.SAJILO_RELAY_DIRECT_PROXY ?? process.env.OPENCODE_RELAY_DIRECT_PROXY ?? ""
+  process.env.SAJILO_RELAY_DIRECT_PROXY ??
+  process.env.OPENCODE_RELAY_DIRECT_PROXY ??
+  relayEnv.SAJILO_RELAY_DIRECT_PROXY ??
+  ""
 const TRACE = "https://www.cloudflare.com/cdn-cgi/trace"
 
 // The direct exit: the second bucket. Measured through the direct proxy (an
