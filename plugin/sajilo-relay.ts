@@ -864,6 +864,42 @@ function mintIdentity(reason: string): Promise<ResetResult> {
 }
 
 /**
+ * Stop a child process AND everything it started.
+ *
+ * The mint runs through cmd.exe, which starts opencode, which starts a server
+ * of its own. Killing only the direct child left the other two running, so
+ * every mint leaked two processes - and a leaked server holds a session, a
+ * plugin instance and a relay timer for the life of the machine.
+ *
+ * Only for children whose descendants are all ours. The rotator's tree
+ * contains the NEW tunnel, which has to survive the kill.
+ */
+function killProcessTree(proc: { pid: number; kill: () => void }): void {
+  if (process.platform === "win32") {
+    try {
+      // taskkill /T walks the tree: cmd.exe, the opencode it started, and the
+      // server that one started. /F makes it immediate. It has to run BEFORE
+      // the direct kill - once the root is dead the tree link is gone, and
+      // only the child would die.
+      const killer = Bun.spawn(["taskkill", "/T", "/F", "/PID", String(proc.pid)], {
+        stdout: "ignore",
+        stderr: "ignore",
+        stdin: "ignore",
+      })
+      killer.unref()
+      return
+    } catch {
+      /* fall through to the plain kill */
+    }
+  }
+  try {
+    proc.kill()
+  } catch {
+    /* already gone */
+  }
+}
+
+/**
  * Start a full reset (both legs), or join the one that is already running.
  * The promise settles when the fresh identity is in place.
  *
@@ -1430,13 +1466,9 @@ async function mintOnce(prompt?: string, force = false): Promise<Record<string, 
       pair = await harvestPair(mintStartedAt)
       if (pair && pair.session && pair.session !== before?.session) break
     }
-    // The child has done its job. Stop it before it spends more quota (or
-    // keeps a session row around).
-    try {
-      proc.kill()
-    } catch {
-      /* already gone */
-    }
+    // The child has done its job. Stop it - and everything it started -
+    // before it spends more quota (or keeps a session row around).
+    killProcessTree(proc)
     const rc = await Promise.race([
       proc.exited,
       Bun.sleep(10_000).then(() => -1),
