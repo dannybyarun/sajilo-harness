@@ -325,7 +325,13 @@ client.chat.completions.create(
 
 The activity log says which path was taken (`JSON mode: response_format asked
 for JSON ...`, then `unwrapped` or `salvaged from reasoning`), so a client that
-still fails can be diagnosed from `<root>/state/relay-activity.log`.
+still fails can be diagnosed from `<root>/state/relay-activity.log`. The
+assembled line also counts the stream (`2422B text, 0 toolCalls, 220 events, 0
+unparsable, done, usage=yes`): `no-done`, a non-zero `unparsable` or a missing
+`usage` all mean the upstream stream was cut short rather than the model
+answering badly. When an answer is rewritten, the raw and the sent text are
+kept as `<root>/state/relay-last-answer-raw.txt` and
+`relay-last-answer-sent.txt`.
 
 ### Two ways to be a provider
 
