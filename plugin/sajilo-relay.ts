@@ -109,7 +109,7 @@ const PORT = Number(env("RELAY_PORT") ?? 43915)
 // A build marker. The doctor reads it to tell which relay wrote the log, and
 // judges only what THIS build did - the log also holds the history of
 // earlier builds, and an old rotation must not fail today's check.
-const BUILD = "json-mode-2026-11-17"
+const BUILD = "json-mode-2026-11-17.4"
 // Where the relay listens. 127.0.0.1 keeps it on this machine (other local
 // agents can still use it). Set it to 0.0.0.0 to serve other machines - but
 // then a token is REQUIRED, because the relay spends the account's quota.
@@ -664,12 +664,22 @@ This request comes from a program, not from a person in a chat. The harness inst
 - Reply with ONE JSON value and nothing else: no prose before or after, no markdown, no code fences, no explanation.
 - Use exactly the shape the user's message asks for. If it names a schema, match it exactly: same keys, same types, no extra keys.
 - If there is nothing to report, return the empty but valid form (for example {"items": []}) instead of a sentence.
+- Answer with the whole value, never a fragment of it - not just the hashtag list out of a moment object, not just the titles. Every key the schema asks for is present.
+- The answer has to parse with a strict JSON parser: double quotes, no trailing commas, no comments, no "..." placeholders.
 - Do not call a tool. The JSON answer itself is the deliverable.`
 
 /**
- * The first balanced JSON object or array inside a text, or null.
+ * Every balanced JSON object or array that parses, in the order it appears.
+ *
+ * A scan that returns only the FIRST balanced value is not enough: a model
+ * that opens with prose often mentions a nested array (the hashtags) before it
+ * writes the object the caller asked for, and a top-level object with one bad
+ * character (a trailing comma) is not a candidate at all - its inner arrays
+ * are. The caller gets the value chosen from this list, so the list has to
+ * hold all of them.
  */
-function firstJsonValue(text: string): string | null {
+function jsonValues(text: string): string[] {
+  const out: string[] = []
   for (let start = 0; start < text.length; start++) {
     const opener = text[start]
     if (opener !== "{" && opener !== "[") continue
@@ -692,22 +702,46 @@ function firstJsonValue(text: string): string | null {
         const candidate = text.slice(start, i + 1)
         try {
           JSON.parse(candidate)
-          return candidate
+          out.push(candidate)
         } catch {
-          if (depth <= 0) break // mismatched at this start; try the next opener
+          /* not a value: a fragment of prose, or a top-level value with a typo */
         }
+        break // either way this opener is done; continue after it
       }
     }
   }
-  return null
+  return out
+}
+
+/**
+ * The value a caller most likely meant, out of everything that parsed.
+ *
+ * The whole answer is bigger than any fragment of it, so the longest value
+ * wins; an object wins a tie, because a caller that asks for `{"items": [...]}`
+ * is the common case and a bare nested array is never the answer. A fragment
+ * is only returned when there is nothing else, which is still better than
+ * failing the parse or handing back prose.
+ */
+function bestJsonValue(values: string[]): string | null {
+  if (values.length === 0) return null
+  let best = values[0]
+  for (const v of values.slice(1)) {
+    const objectBonus = v.startsWith("{") ? 1 : 0
+    const bestBonus = best.startsWith("{") ? 1 : 0
+    if (v.length > best.length || (v.length === best.length && objectBonus > bestBonus)) {
+      best = v
+    }
+  }
+  return best
 }
 
 /**
  * Make a JSON-mode answer parseable for a client that reads `content`
  * literally: strip a ```json fence, and if the text is not itself JSON, take
- * the first balanced JSON value out of the surrounding prose. Anything else is
- * returned untouched, so a model that already answered correctly is never
- * rewritten.
+ * the whole JSON value out of the surrounding prose - not the first bracket
+ * that happens to balance (that is how a hashtag array was once handed to a
+ * caller in place of the object it asked for). Anything else is returned
+ * untouched, so a model that already answered correctly is never rewritten.
  */
 export function unwrapJson(text: string): string {
   const trimmed = (text ?? "").trim()
@@ -718,7 +752,7 @@ export function unwrapJson(text: string): string {
     JSON.parse(body)
     return body
   } catch {
-    return firstJsonValue(body) ?? body
+    return bestJsonValue(jsonValues(body)) ?? body
   }
 }
 
@@ -3250,27 +3284,50 @@ function startServer(): void {
           // Caller wanted a non-stream JSON completion; the gateway only does
           // SSE, so reassemble the stream into a chat.completion object.
           const chunks: Array<{ choices?: any[]; usage?: any; [k: string]: any }> = []
+          // Diagnostics for a caller whose JSON came back broken: a lost event
+          // and an upstream that never said [DONE] both mean the answer was cut,
+          // which the assembled body cannot show.
+          let badEvents = 0
+          let sawDone = false
           try {
             const reader = upstream.body!.getReader()
             const dec = new TextDecoder()
             let buf = ""
+            // A line is only a line once its "\n" has arrived. Draining
+            // `buf.split("\n")` while slicing the buffer dropped the trailing
+            // partial line of every read - and that partial line is the head of
+            // the next event, so characters went missing out of the assembled
+            // answer ("approacheser", `"start":62":9`). Keep the tail, complete
+            // it with the next read, and parse only complete lines.
+            const takeLine = (line: string) => {
+              const t = line.trim()
+              if (!t.startsWith("data:")) return
+              const payload = t.slice(5).trim()
+              if (payload === "[DONE]") {
+                sawDone = true
+                return
+              }
+              try {
+                chunks.push(JSON.parse(payload))
+              } catch {
+                // A payload that does not parse is either keep-alive noise or a
+                // piece of the answer that was lost on the way in. Counting it
+                // is how the two are told apart after the fact.
+                if (payload.length > 1 && payload[0] === "{") badEvents++
+              }
+            }
             for (;;) {
               const { done, value } = await reader.read()
               if (done) break
               buf += dec.decode(value, { stream: true })
-              for (const line of buf.split("\n")) {
-                buf = buf.slice(line.length + 1)
-                const t = line.trim()
-                if (!t.startsWith("data:")) continue
-                const payload = t.slice(5).trim()
-                if (payload === "[DONE]") continue
-                try {
-                  chunks.push(JSON.parse(payload))
-                } catch {
-                  /* partial line or keep-alive noise */
-                }
+              let nl = buf.indexOf("\n")
+              while (nl >= 0) {
+                takeLine(buf.slice(0, nl))
+                buf = buf.slice(nl + 1)
+                nl = buf.indexOf("\n")
               }
             }
+            if (buf.trim()) takeLine(buf)
           } catch (e) {
             logActivity(`[${new Date().toISOString()}] SSE-COLLECT-ERROR ${String(e).slice(0, 200)}`)
           }
@@ -3315,8 +3372,20 @@ function startServer(): void {
               logActivity(
                 `[${new Date().toISOString()}] JSON mode: ${
                   text.trim() ? "unwrapped" : "salvaged from reasoning"
-                } for the caller (${text.length}B -> ${unwrapped.length}B)`,
+                } for the caller (${text.length}B -> ${unwrapped.length}B) raw=${JSON.stringify(
+                  answer.slice(0, 300),
+                )}`,
               )
+              // The rewritten answer is the one thing that is otherwise lost: a
+              // caller that still misbehaves can be diagnosed by comparing
+              // what the model said with what it was handed.
+              try {
+                mkdirSync(DUMP_DIR, { recursive: true })
+                writeFileSync(`${DUMP_DIR}/relay-last-answer-raw.txt`, answer)
+                writeFileSync(`${DUMP_DIR}/relay-last-answer-sent.txt`, unwrapped)
+              } catch {
+                /* a dump must never fail a request */
+              }
               text = unwrapped
             }
           }
@@ -3340,7 +3409,7 @@ function startServer(): void {
             ...(usage ? { usage } : {}),
           }
           logActivity(
-            `[${new Date().toISOString()}] NONSTREAM-JSON assembled (${text.length}B text, ${toolCalls?.length ?? 0} toolCalls)`,
+            `[${new Date().toISOString()}] NONSTREAM-JSON assembled (${text.length}B text, ${toolCalls?.length ?? 0} toolCalls, ${chunks.length} events, ${badEvents} unparsable, ${sawDone ? "done" : "no-done"}, usage=${usage ? "yes" : "no"})`,
           )
           return new Response(JSON.stringify(completion), {
             status: 200,

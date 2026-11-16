@@ -1,2 +1,5 @@
 *.log
 .DS_Store
+# Captured from the live runtime by the relay (the harness fingerprint it
+# replays); it is generated per instance, never a source file.
+plugin/resources/harness-spec.json

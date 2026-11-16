@@ -205,6 +205,16 @@ describe("unwrapJson", () => {
     )
   })
 
+  test("a nested array mentioned before the real object does not steal the answer", () => {
+    const answer = '{"items":[{"start":4,"hashtags":["#a","#b"]}]}'
+    expect(relay.unwrapJson(`Tags like ["#a","#b"] then the result: ${answer}`)).toBe(answer)
+    expect(relay.unwrapJson(`["#a","#b"]\n\n{"items":[]}`)).toBe('{"items":[]}')
+  })
+
+  test("a bare hashtag list with no real object is still returned, not prose", () => {
+    expect(relay.unwrapJson('The tags were ["#a","#b"].')).toBe('["#a","#b"]')
+  })
+
   test("braces inside strings do not confuse the scan", () => {
     const answer = '{"why":"he said {wow} and [then] left","items":[]}'
     expect(relay.unwrapJson(`The moment: ${answer}`)).toBe(answer)
