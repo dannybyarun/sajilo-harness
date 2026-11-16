@@ -23,6 +23,9 @@ jobs:
           cp plugin/sajilo-relay.ts pkg/plugin/
           cp plugin/resources/* pkg/plugin/resources/
           cp install.sh install.ps1 install.cmd sajilo sajilo.cmd README.md pkg/
+          # The Linux one-click extras: the double-clickable entry and the
+          # make targets.
+          cp Makefile install-linux.desktop pkg/
           # The whole bin dir: the tunnel farm (tunnels.ps1), the rotator
           # (usque-rotate.*), the doctor and the rebranding helpers.
           cp bin/* pkg/bin/ 2>/dev/null || true
@@ -66,6 +69,9 @@ jobs:
             ```bash
             curl -fsSL https://raw.githubusercontent.com/dannybyarun/sajilo-harness/main/install.sh | bash
             ```
+
+            On Linux you can also double-click `install-linux.desktop` (or
+            run `make install` from the unpacked folder).
 
             See the README for the platform matrix (the rotatable WARP tunnel
             needs `usque`; elsewhere the relay uses the native egress).

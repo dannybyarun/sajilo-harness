@@ -33,6 +33,8 @@ jobs:
           bash -n sajilo
           bash -n install.sh
           bash -n bin/sajilo-rebrand.sh
+          bash -n bin/warp-rotate.sh
+          bash -n bin/tunnel-watchdog.sh
 
       - name: unit tests
         run: bun test

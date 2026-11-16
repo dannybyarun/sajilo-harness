@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Install Sajilo
+Comment=Install the Sajilo coding agent harness on this machine
+Exec=/bin/bash -c "p=\"%k\"; case \"$p\" in file://*) p=${p#file://} ;; esac; d=$(dirname \"$p\"); cd \"$d\" || exit 1; bash install.sh --run; printf '\n\nPress Enter to close. '; read -r _"
+Terminal=true
+Categories=Utility;Development;
+Icon=terminal

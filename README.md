@@ -66,9 +66,48 @@ Or from a clone:
 
 ```bash
 git clone https://github.com/dannybyarun/sajilo-harness.git
-cd sajilo
+cd sajilo-harness
 bash install.sh
 ```
+
+Or, from a clone, as a make target:
+
+```bash
+make install
+```
+
+### Linux - double click
+
+The repo ships `install-linux.desktop`: a double-clickable entry that runs
+the installer in a terminal and starts Sajilo when it is done. Download the
+repo, make the file executable (`chmod +x install-linux.desktop`) and open it.
+
+If your file manager refuses to run it, mark it trusted ("Allow Launching"),
+or just run `bash install.sh` in a terminal.
+
+### What the installer can be told to do
+
+| command | what it does |
+|---|---|
+| `bash install.sh` | install (or reinstall) the instance, then start Sajilo (a terminal asks first) |
+| `bash install.sh --run` | install and start Sajilo without asking |
+| `bash install.sh --no-run` | install only, do not start Sajilo |
+| `bash install.sh --status` | report what is installed; change nothing |
+| `bash install.sh --no-tunnel` | install without the rotatable WARP tunnel (the relay resets the identity instead) |
+| `bash install.sh --uninstall` | remove the instance and the launcher from PATH - your opencode, its config and its sessions are not touched, and your harness spec is copied to `~/.sajilo-spec-backup-<date>` before the instance goes |
+| `bash install.sh --help` | the same list |
+
+`make check` runs the same syntax checks CI runs; `make status` and
+`make uninstall` are the make targets for `--status` and `--uninstall`.
+
+After the install, `sajilo` works **in the shell you are in**: the launcher is
+linked into a directory that is already on your PATH (`/usr/local/bin` when
+that is writable), and `~/.local/bin` is added to your shell rc files as
+well - so a new terminal has it too.
+
+A reinstall is safe: your harness spec is kept (the new one lands next to it
+as `*.bak`), and the runtime stays pinned to the binary the instance already
+uses.
 
 ### What the installer does for you
 
@@ -76,7 +115,7 @@ bash install.sh
 |---|---|
 | instance layout | `~/.sajilo` (`%USERPROFILE%\.sajilo`): own HOME, DB, sessions, project, relay port, pins, logs |
 | harness spec | the relay plugin and the prompt/tool resources, from the clone or downloaded from the repo |
-| launcher | `sajilo` on your PATH, plus a desktop shortcut (Windows) or launcher (Linux) |
+| launcher | `sajilo` on your PATH, plus an app-menu entry and a desktop launcher (Linux) or a desktop shortcut (Windows) |
 | runtime | your existing opencode is used and pinned; if the machine has none, the standalone build is downloaded into the instance |
 | **tunnel** | the rotatable WARP tunnel is **installed if it is missing** - `usque`, a user-space WARP client: one binary, one config file, one HTTP proxy. **No administrator rights, no service, no UAC.** Rotating it is registering a new anonymous account |
 
@@ -739,6 +778,11 @@ startup and leaves every other key alone:
 ```
 
 Your MCP, your permissions, your agents - and Sajilo's provider on top.
+
+On a **fresh** instance there is no config file yet, so the relay creates
+`opencode.json` with the provider in it - there is nothing of yours to
+preserve, and without it the runtime knows no sajilo provider at all: the
+model picker lists nothing, and the harness has no default model.
 
 Per-model keys are yours too: the merge seeds each free model with its real
 `limit` (the gateway's own numbers - three 200k, the rest 262k to 1M), but
