@@ -37,6 +37,10 @@
  *   - tools   <- the 12-tool harness set + caller's tools appended
  *   - session ids / trace ids / UA injected (caller values, if any, win so
  *     real opencode sessions keep their own identity)
+ *   - JSON mode: a caller that sends `response_format` of json_object or
+ *     json_schema is not a chat, it is an API. The whitelist shape stays, but
+ *     a final rule tells the model to answer with one JSON value and call no
+ *     tools, and the assembled answer is unwrapped if it came back fenced.
  *
  * Endpoints:
  *   POST /openai/v1/<path>  -> https://opencode.ai/inference/openai/v1/<path>
@@ -105,7 +109,7 @@ const PORT = Number(env("RELAY_PORT") ?? 43915)
 // A build marker. The doctor reads it to tell which relay wrote the log, and
 // judges only what THIS build did - the log also holds the history of
 // earlier builds, and an old rotation must not fail today's check.
-const BUILD = "reset-429-2026-11-16-catalogue"
+const BUILD = "json-mode-2026-11-17"
 // Where the relay listens. 127.0.0.1 keeps it on this machine (other local
 // agents can still use it). Set it to 0.0.0.0 to serve other machines - but
 // then a token is REQUIRED, because the relay spends the account's quota.
@@ -626,6 +630,98 @@ function stripModelBlock(text: string): string {
   return text.replace(/\r?\n# Your Model\r?\n(?:- .*\r?\n?)*/g, "\n")
 }
 
+/**
+ * Does this request ask for a JSON answer?
+ *
+ * `response_format` is the signal every structured-output client already sends
+ * (`json_object`, `json_schema`), so a caller gets JSON mode without changing
+ * anything on its side. SAJILO_RELAY_JSON=1 forces it for a client that has no
+ * way to ask.
+ */
+export function wantsJson(body: unknown): boolean {
+  if (body && typeof body === "object") {
+    const rf = (body as { response_format?: unknown }).response_format
+    const type = rf && typeof rf === "object" ? (rf as { type?: unknown }).type : undefined
+    if (type === "json_object" || type === "json_schema") return true
+  }
+  const flag = env("RELAY_JSON")?.toLowerCase()
+  return flag === "1" || flag === "true" || flag === "on" || flag === "yes"
+}
+
+/**
+ * The rule that makes the model answer like an API instead of an agent.
+ *
+ * The harness prompt and the 12 tools are the gateway's whitelist fingerprint,
+ * so they stay in the request - but they describe a coding agent, and a
+ * structured-output caller is not one. In JSON mode this section is appended
+ * LAST, after the harness and after the tool notes, so it is the final thing
+ * the model reads before the conversation. Without it the model answers the
+ * harness ("here is my plan", a tool call, a refusal) and the caller's parser
+ * finds no JSON in it.
+ */
+export const JSON_MODE_RULE = `# JSON mode
+This request comes from a program, not from a person in a chat. The harness instructions above describe how this relay is invoked; they do not change the answer format.
+- Reply with ONE JSON value and nothing else: no prose before or after, no markdown, no code fences, no explanation.
+- Use exactly the shape the user's message asks for. If it names a schema, match it exactly: same keys, same types, no extra keys.
+- If there is nothing to report, return the empty but valid form (for example {"items": []}) instead of a sentence.
+- Do not call a tool. The JSON answer itself is the deliverable.`
+
+/**
+ * The first balanced JSON object or array inside a text, or null.
+ */
+function firstJsonValue(text: string): string | null {
+  for (let start = 0; start < text.length; start++) {
+    const opener = text[start]
+    if (opener !== "{" && opener !== "[") continue
+    let depth = 0
+    let inString = false
+    let escaped = false
+    for (let i = start; i < text.length; i++) {
+      const c = text[i]
+      if (inString) {
+        if (escaped) escaped = false
+        else if (c === "\\") escaped = true
+        else if (c === '"') inString = false
+        continue
+      }
+      if (c === '"') inString = true
+      else if (c === "{" || c === "[") depth++
+      else if (c === "}" || c === "]") {
+        depth--
+        if (depth > 0) continue
+        const candidate = text.slice(start, i + 1)
+        try {
+          JSON.parse(candidate)
+          return candidate
+        } catch {
+          if (depth <= 0) break // mismatched at this start; try the next opener
+        }
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Make a JSON-mode answer parseable for a client that reads `content`
+ * literally: strip a ```json fence, and if the text is not itself JSON, take
+ * the first balanced JSON value out of the surrounding prose. Anything else is
+ * returned untouched, so a model that already answered correctly is never
+ * rewritten.
+ */
+export function unwrapJson(text: string): string {
+  const trimmed = (text ?? "").trim()
+  if (!trimmed) return trimmed
+  const fenced = /^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i.exec(trimmed)
+  const body = fenced ? fenced[1].trim() : trimmed
+  try {
+    JSON.parse(body)
+    return body
+  } catch {
+    return firstJsonValue(body) ?? body
+  }
+}
+
 function transformBody(raw: string): string {
   let parsed: Record<string, unknown>
   try {
@@ -634,6 +730,10 @@ function transformBody(raw: string): string {
     return raw // not JSON; upstream will error; pass through untouched
   }
   const msgs = Array.isArray(parsed.messages) ? [...parsed.messages] : []
+  // A structured-output caller (peakcut, an SDK with a schema, anything using
+  // `response_format`) is not a coding-agent conversation. It gets the same
+  // whitelist shape, plus a rule that says the answer is data.
+  const jsonMode = wantsJson(parsed)
   const systems: string[] = []
   const rawSystems: string[] = []
   const rest: Array<Record<string, unknown>> = []
@@ -734,6 +834,17 @@ function transformBody(raw: string): string {
         .join(", ")}). Use ONLY those - the other tools in this list belong to the harness and the caller cannot run them, so a call to one breaks the turn.`,
     }
   }
+  // Last, so it overrides the harness prompt above it: the answer is one JSON
+  // value, not agent prose and not a tool call.
+  if (jsonMode) {
+    rewritten[0] = {
+      ...rewritten[0],
+      content: `${rewritten[0].content}\n\n${JSON_MODE_RULE}`,
+    }
+    logActivity(
+      `[${new Date().toISOString()}] JSON mode: response_format asked for JSON - the answer is steered to one JSON value and the harness tools are left uncalled`,
+    )
+  }
   parsed.messages = rewritten
   parsed.tools = mergedTools
   delete parsed.max_tokens
@@ -746,6 +857,9 @@ function transformBody(raw: string): string {
 }
 
 const callerStreamWants = new WeakMap<Request, boolean>()
+// The same for JSON mode: the rewritten body is what goes upstream, so the
+// caller's own `response_format` has to be remembered separately.
+const callerJsonWants = new WeakMap<Request, boolean>()
 
 // ---- the 429 path: reset the limit, keep the model (Nov 13 2026) -----------
 // The free allowance is a rolling window over per-model pools AND per-project
@@ -2411,12 +2525,16 @@ function startServer(): void {
           const raw = await req.text()
           rawBody = raw
           let wantStream = true
+          let wantJson = wantsJson(null)
           try {
-            wantStream = (JSON.parse(raw) as { stream?: boolean }).stream !== false
+            const b = JSON.parse(raw) as { stream?: boolean }
+            wantStream = b.stream !== false
+            wantJson = wantsJson(b)
           } catch {
             /* treat as streaming intent */
           }
           callerStreamWants.set(req, wantStream)
+          callerJsonWants.set(req, wantJson)
           transformed = transformBody(raw)
           // Full-body dumps for offline bisecting (the activity log truncates).
           // They land in the instance's own state dir, not in /tmp - on
@@ -3183,6 +3301,24 @@ function startServer(): void {
                 if (tc.function?.name) acc.function.name += tc.function.name
                 if (tc.function?.arguments) acc.function.arguments += tc.function.arguments
               }
+          }
+          // A JSON caller parses `content` literally, and a model in JSON mode
+          // still sometimes wraps the object in a fence, leads with a
+          // sentence, or (on a reasoning model) writes the JSON into its
+          // reasoning and leaves `content` empty. Normalise that here; a
+          // correct answer is returned unchanged.
+          if (callerJsonWants.get(req)) {
+            const answer = text.trim() ? text : (reasoning ?? "")
+            const unwrapped = unwrapJson(answer)
+            const usable = text.trim() ? unwrapped !== text : unwrapped !== answer.trim() && unwrapped.length > 0
+            if (usable && unwrapped !== text) {
+              logActivity(
+                `[${new Date().toISOString()}] JSON mode: ${
+                  text.trim() ? "unwrapped" : "salvaged from reasoning"
+                } for the caller (${text.length}B -> ${unwrapped.length}B)`,
+              )
+              text = unwrapped
+            }
           }
           const completion: Record<string, unknown> = {
             id: lastObj.id ?? "chatcmpl-relay-nostream",

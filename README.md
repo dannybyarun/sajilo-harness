@@ -284,10 +284,48 @@ What is verified working through that endpoint:
 | `POST /v1/chat/completions` | `200` with a normal JSON completion |
 | the same with `"stream": true` | `text/event-stream`, `chat.completion.chunk` frames, `data: [DONE]` |
 | the same with `"tools": [...]` | real `tool_calls` back, arguments included |
+| the same with `"response_format": {"type": "json_object"}` | `content` is one JSON value (JSON mode - see below) |
 | `Authorization: Bearer <anything>` | accepted - the key is ignored |
 
 Both paths work: `/v1/...` (what every SDK appends to a base URL) and
 `/openai/v1/...`.
+
+### JSON mode for programs, not chats
+
+A caller that sends `response_format` is an API, not a conversation: it does
+not want a plan, a tool call or a friendly sentence, it wants one JSON value
+that its parser can read. Anything that asks for structured output - an SDK
+with a schema, a script that loops over jobs, a BYOK app - usually sends no
+system prompt at all, so without help the model answers the relay's agent
+prompt instead and the caller fails with "the AI did not answer with JSON".
+
+The relay detects `"response_format": {"type": "json_object"}` or
+`{"type": "json_schema"}` and switches to JSON mode:
+
+- the request keeps the harness prompt and the 12 tools (they are the
+  gateway's whitelist fingerprint - dropping them gets a 429),
+- a final `# JSON mode` rule is appended **after** the harness and the tool
+  notes, so it is the last thing the model reads: one JSON value, nothing
+  else, no fences, no tool calls, and the empty-but-valid form when there is
+  nothing to report,
+- the answer is unwrapped on the way back: a fenced block or a JSON object
+  behind a sentence is reduced to the JSON itself, and if a reasoning model
+  put the JSON in `reasoning_content` and left `content` empty, it is salvaged
+  from there. A correct answer is returned untouched.
+
+If the client has no way to ask, force it with `SAJILO_RELAY_JSON=1`.
+
+```python
+client.chat.completions.create(
+    model="deepseek-v4.1-flash-free",
+    messages=[{"role": "user", "content": "List reaction signals as JSON."}],
+    response_format={"type": "json_object"},
+)
+```
+
+The activity log says which path was taken (`JSON mode: response_format asked
+for JSON ...`, then `unwrapped` or `salvaged from reasoning`), so a client that
+still fails can be diagnosed from `<root>/state/relay-activity.log`.
 
 ### Two ways to be a provider
 
@@ -847,6 +885,7 @@ file.
 | `SAJILO_RELAY_CATALOGUE_REFRESH_MS` | how often the catalogue is refreshed in the background (default 6 h) |
 | `SAJILO_RELAY_MODELS_CACHE` | where the learned catalogue is cached (default `<root>/state/models-cache.json`) |
 | `SAJILO_RELAY_LOG_MAX_BYTES` | rotate the activity log at this size (default 10485760 = 10 MB; one `.1` generation is kept) |
+| `SAJILO_RELAY_JSON` | `1` = every request answers as JSON mode, one JSON value and no tool calls (normally switched on per request by `response_format`, which needs no configuration) |
 | `OPENCODE_BIN` | legacy alias for `SAJILO_BIN` |
 
 The `OPENCODE_RELAY_*` names still work everywhere a `SAJILO_RELAY_*` name is

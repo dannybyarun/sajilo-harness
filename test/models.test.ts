@@ -155,3 +155,63 @@ describe("freeModelList", () => {
     }
   })
 })
+
+describe("wantsJson", () => {
+  test("response_format is the signal a structured-output caller sends", () => {
+    expect(relay.wantsJson({ response_format: { type: "json_object" } })).toBe(true)
+    expect(relay.wantsJson({ response_format: { type: "json_schema", json_schema: {} } })).toBe(true)
+  })
+
+  test("an ordinary chat request is not JSON mode", () => {
+    expect(relay.wantsJson({})).toBe(false)
+    expect(relay.wantsJson({ response_format: { type: "text" } })).toBe(false)
+    expect(relay.wantsJson({ response_format: null })).toBe(false)
+    expect(relay.wantsJson(null)).toBe(false)
+    expect(relay.wantsJson("nope")).toBe(false)
+  })
+
+  test("the environment flag forces it for a client that cannot ask", () => {
+    const before = process.env.SAJILO_RELAY_JSON
+    try {
+      for (const value of ["1", "true", "on", "yes", "TRUE"]) {
+        process.env.SAJILO_RELAY_JSON = value
+        expect(relay.wantsJson({})).toBe(true)
+      }
+      for (const value of ["0", "false", "", "off"]) {
+        process.env.SAJILO_RELAY_JSON = value
+        expect(relay.wantsJson({})).toBe(false)
+      }
+    } finally {
+      if (before === undefined) delete process.env.SAJILO_RELAY_JSON
+      else process.env.SAJILO_RELAY_JSON = before
+    }
+  })
+})
+
+describe("unwrapJson", () => {
+  test("a correct answer is returned untouched", () => {
+    expect(relay.unwrapJson('{"items":[]}')).toBe('{"items":[]}')
+    expect(relay.unwrapJson("  [1,2,3]\n")).toBe("[1,2,3]")
+  })
+
+  test("a fenced answer is unwrapped", () => {
+    expect(relay.unwrapJson('```json\n{"items":[{"start":4}]}\n```')).toBe('{"items":[{"start":4}]}')
+    expect(relay.unwrapJson('```\n{"items":[]}\n```')).toBe('{"items":[]}')
+  })
+
+  test("an object behind a sentence is extracted", () => {
+    expect(relay.unwrapJson('Sure! Here you go: {"items":[{"start":4}]} - enjoy.')).toBe(
+      '{"items":[{"start":4}]}',
+    )
+  })
+
+  test("braces inside strings do not confuse the scan", () => {
+    const answer = '{"why":"he said {wow} and [then] left","items":[]}'
+    expect(relay.unwrapJson(`The moment: ${answer}`)).toBe(answer)
+  })
+
+  test("text with no JSON at all is still returned, trimmed", () => {
+    expect(relay.unwrapJson("  I cannot help with that.  ")).toBe("I cannot help with that.")
+    expect(relay.unwrapJson("")).toBe("")
+  })
+})
