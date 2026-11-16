@@ -572,6 +572,12 @@ function Action-Ensure {
 
 function Action-Rotate {
   if (-not (Test-Path $Usque)) { Say "no usque at $Usque - nothing to rotate"; return }
+  # A rotation must NOT reshuffle the instance: the layout it writes down
+  # (which leg is primary, which slot is the reserve) is the one the launcher
+  # settled on. Without this, a rotation would write the DEFAULTS over it -
+  # and the reserve would quietly stop being a reserve.
+  $script:SlotsAreAlt = Get-SavedSlotsAreAlt
+  $script:Reserve = Get-SavedReserve
   $s = if ($Slot -ge 0) { $Slot } else { 0 }
   $paths = Get-SlotPaths $s
   # A slot whose port drifted keeps its real port.
