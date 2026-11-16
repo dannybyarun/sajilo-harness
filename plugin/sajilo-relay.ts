@@ -146,18 +146,64 @@ const AGENT_TOOLS = JSON.parse(
 ) as Array<Record<string, unknown>>
 
 // The free pool, as the runtime's own provider presents it.
-const SAJILO_MODEL_LIST: Record<string, { name: string }> = {
-  "deepseek-v4.1-flash-free": { name: "DeepSeek V4.1 Flash Free" },
-  "glm-5.3-flash-free": { name: "GLM 5.3 Flash Free" },
-  "mimo-v2.6-flash-free": { name: "MiMo v2.6 Flash Free" },
-  "longcat-2.5-free": { name: "LongCat 2.5" },
-  "iceman-free": { name: "Iceman" },
-  "inkling-2-small-free": { name: "Inkling 2 Small" },
-  "beam-free": { name: "Beam" },
-  "flint-40b-free": { name: "Flint 40B" },
-  "nemotron-3.5-lightning-free": { name: "Nemotron 3.5 Lightning" },
-  "minimax-m3.1-flash-free": { name: "MiniMax M3.1 Flash" },
-  "nemotron-3.5-super-vl-free": { name: "Nemotron 3.5 Super VL" },
+//
+// The limits are the gateway's own published numbers (GET
+// /inference/openai/v1/models, cross-checked against models.dev), not guesses:
+// a model declared without them is silently treated as 200k context / 32k
+// output by the runtime, which compacts a 1M-token model six times too early.
+// Three free variants really are 200k; the rest are not.
+const SAJILO_MODEL_LIST: Record<
+  string,
+  { name: string; limit: { context: number; output: number; input?: number } }
+> = {
+  "deepseek-v4.1-flash-free": {
+    name: "DeepSeek V4.1 Flash Free",
+    limit: { context: 200_000, output: 32_000 },
+  },
+  "glm-5.3-flash-free": {
+    name: "GLM 5.3 Flash Free",
+    limit: { context: 200_000, output: 32_000 },
+  },
+  "mimo-v2.6-flash-free": {
+    name: "MiMo v2.6 Flash Free",
+    limit: { context: 200_000, output: 32_000 },
+  },
+  "longcat-2.5-free": {
+    name: "LongCat 2.5",
+    limit: { context: 1_000_000, output: 262_144 },
+  },
+  "iceman-free": {
+    name: "Iceman",
+    limit: { context: 262_144, output: 131_072 },
+  },
+  "inkling-2-small-free": {
+    name: "Inkling 2 Small",
+    limit: { context: 1_048_576, output: 131_072 },
+  },
+  "beam-free": {
+    name: "Beam",
+    limit: { context: 1_048_576, output: 131_072 },
+  },
+  "flint-40b-free": {
+    name: "Flint 40B",
+    limit: { context: 262_144, output: 65_536 },
+  },
+  "nemotron-3.5-lightning-free": {
+    name: "Nemotron 3.5 Lightning",
+    limit: { context: 262_144, output: 262_144 },
+  },
+  "minimax-m3.1-flash-free": {
+    name: "MiniMax M3.1 Flash",
+    limit: { context: 1_000_000, output: 512_000 },
+  },
+  "nemotron-3.5-super-vl-free": {
+    name: "Nemotron 3.5 Super VL",
+    limit: { context: 1_048_576, input: 1_048_576, output: 131_072 },
+  },
+  "hy4-flash-free": {
+    name: "Hy4 Flash",
+    limit: { context: 1_048_576, input: 983_040, output: 65_536 },
+  },
 }
 
 // ---------------------------------------------------------------------------
@@ -498,10 +544,11 @@ const callerStreamWants = new WeakMap<Request, boolean>()
 //
 // The free pool is not hand-picked: the gateway publishes the whole
 // catalogue at GET /inference/openai/v1/models (which is NOT behind the
-// whitelist - a bare curl gets it), and it lists exactly eleven free models.
-// Ten of them are text-capable chat models; nemotron-3.5-super-vl-free is
+// whitelist - a bare curl gets it), and it lists twelve free models.
+// Eleven of them are text-capable chat models; nemotron-3.5-super-vl-free is
 // vision-first, so it stays last. minimax-m3.1-flash-free was missing from
-// the original hand-written list even though it is one of the free models.
+// the original hand-written list even though it is one of the free models,
+// and hy4-flash-free landed on 2026-11-16.
 // The model Sajilo leads with. The harness asks for it by default, and the
 // relay falls back to it when a request carries no model at all.
 const DEFAULT_MODEL = "deepseek-v4.1-flash-free"
@@ -517,6 +564,7 @@ const FREE_POOL_FALLBACK = [
   "flint-40b-free",
   "nemotron-3.5-lightning-free",
   "minimax-m3.1-flash-free",
+  "hy4-flash-free",
   "nemotron-3.5-super-vl-free",
 ]
 
@@ -527,12 +575,20 @@ const FREE_POOL_FALLBACK = [
  */
 function freeModelList(): Array<Record<string, unknown>> {
   const ids = [DEFAULT_MODEL, ...FREE_POOL_FALLBACK].filter((m, i, a) => a.indexOf(m) === i)
-  return ids.map((id) => ({
-    id,
-    object: "model",
-    created: 0,
-    owned_by: "sajilo",
-  }))
+  return ids.map((id) => {
+    const limit = SAJILO_MODEL_LIST[id]?.limit
+    return {
+      id,
+      object: "model",
+      created: 0,
+      owned_by: "sajilo",
+      // Published so a client that reads the catalogue gets the real window
+      // instead of guessing (or falling back to 200k).
+      ...(limit
+        ? { context_length: limit.context, max_context_length: limit.context, max_completion_tokens: limit.output }
+        : {}),
+    }
+  })
 }
 
 function setModel(body: string, model: string): string {
@@ -3045,13 +3101,35 @@ function mergeRuntimeConfig(port: number): void {
   }
   const providerId = which === "opencode" ? "opencode" : "sajilo"
   const providerName = providerId === "opencode" ? "OpenCode" : "Sajilo"
+  const allProviders =
+    typeof cfg.provider === "object" && cfg.provider
+      ? (cfg.provider as Record<string, unknown>)
+      : {}
+  // Merge the model map instead of replacing it. Replacing it wiped every
+  // per-model key the user (or an older release) had put there, and a model
+  // with no `limit` is read as 200k/32k no matter what the model really holds.
+  // Our entry is the seed; anything the config already says wins, and models
+  // the user added by hand are kept.
+  const current = allProviders[providerId]
+  const currentModels =
+    typeof current === "object" && current && typeof (current as Record<string, unknown>).models === "object"
+      ? ((current as Record<string, unknown>).models as Record<string, Record<string, unknown>>)
+      : {}
+  const models: Record<string, Record<string, unknown>> = {}
+  for (const [id, spec] of Object.entries(SAJILO_MODEL_LIST)) {
+    const prev = currentModels[id]
+    models[id] = { ...spec, ...(typeof prev === "object" && prev ? prev : {}) }
+  }
+  for (const [id, spec] of Object.entries(currentModels)) {
+    if (!(id in models)) models[id] = spec
+  }
   const provider: Record<string, unknown> = {
-    ...(typeof cfg.provider === "object" && cfg.provider ? (cfg.provider as Record<string, unknown>) : {}),
+    ...allProviders,
     [providerId]: {
       npm: "@ai-sdk/openai-compatible",
       name: providerName,
       options: { baseURL: `http://127.0.0.1:${port}/openai/v1` },
-      models: SAJILO_MODEL_LIST,
+      models,
     },
   }
   const before = JSON.stringify(cfg)

@@ -696,6 +696,12 @@ startup and leaves every other key alone:
 
 Your MCP, your permissions, your agents - and Sajilo's provider on top.
 
+Per-model keys are yours too: the merge seeds each free model with its real
+`limit` (the gateway's own numbers - three 200k, the rest 262k to 1M), but
+anything the file already says for that model wins, and models you add by hand
+are kept. A model with no `limit` is read as 200k/32k by the runtime, so a
+1M-token model would compact six times too early.
+
 One trap worth knowing: **a UTF-8 BOM in the config file makes opencode ignore
 the whole file.** PowerShell's `Set-Content -Encoding utf8` writes one, and so
 do some Windows editors. If your MCP servers mysteriously disappear, check the
