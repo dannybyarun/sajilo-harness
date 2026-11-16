@@ -3465,28 +3465,43 @@ function startServer(): void {
  * JSONC comments and trailing commas are tolerated: the file is parsed as
  * JSONC, and if it cannot be parsed the config is left exactly as it is.
  */
-function mergeRuntimeConfig(port: number): void {
+export function mergeRuntimeConfig(port: number): void {
+  const model = readModelPin()
+  const which = (env("RELAY_PROVIDER") ?? "sajilo").toLowerCase()
+  if (which === "none") {
+    // "direct": the runtime talks to the gateway without the relay. Leave the
+    // user's config exactly as it is.
+    return
+  }
+
   const dir = `${process.env.HOME ?? ""}/.config/opencode`
   const candidates = [`${dir}/opencode.json`, `${dir}/opencode.jsonc`]
-  const file = candidates.find((f) => {
+  let file = candidates.find((f) => {
     try {
       return existsSync(f)
     } catch {
       return false
     }
   })
-  if (!file) {
-    logActivity(
-      `[${new Date().toISOString()}] CONFIG no config file found in ${dir} (looked for opencode.json and opencode.jsonc)`,
-    )
-    return
-  }
-
   let raw = ""
-  try {
-    raw = readFileSync(file, "utf8")
-  } catch {
-    return
+  if (!file) {
+    // A FRESH instance: there is no config file, so there is nothing of the
+    // user's to preserve - and without a config the runtime knows no sajilo
+    // provider at all: the model picker lists nothing, the harness has no
+    // default model, and the identity is not "Sajilo". So the file is
+    // CREATED with our provider in it. An existing file is still never
+    // touched beyond our own keys.
+    file = candidates[0]
+    raw = "{}"
+    logActivity(
+      `[${new Date().toISOString()}] CONFIG no config file found in ${dir} - creating ${file} with the sajilo provider`,
+    )
+  } else {
+    try {
+      raw = readFileSync(file, "utf8")
+    } catch {
+      return
+    }
   }
   // Strip a UTF-8 BOM: opencode's parser rejects the whole file when one is
   // there, and Windows editors love to add them.
@@ -3507,13 +3522,6 @@ function mergeRuntimeConfig(port: number): void {
     return
   }
 
-  const model = readModelPin()
-  const which = (env("RELAY_PROVIDER") ?? "sajilo").toLowerCase()
-  if (which === "none") {
-    // "direct": the runtime talks to the gateway without the relay. Leave the
-    // user's config exactly as it is.
-    return
-  }
   const providerId = which === "opencode" ? "opencode" : "sajilo"
   const providerName = providerId === "opencode" ? "OpenCode" : "Sajilo"
   const allProviders =
@@ -3543,6 +3551,7 @@ function mergeRuntimeConfig(port: number): void {
   if (model) cfg.model = `${providerId}/${model}`
   if (before === JSON.stringify(cfg)) return
   try {
+    mkdirSync(dir, { recursive: true })
     writeFileSync(file, JSON.stringify(cfg, null, 2))
     logActivity(
       `[${new Date().toISOString()}] CONFIG merged the sajilo provider into ${file} (the rest of your config is untouched)`,
