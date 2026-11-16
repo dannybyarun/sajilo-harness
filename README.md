@@ -32,8 +32,9 @@ everything the relay knows how to do:
   - and retries **the same model**; it never rotates to a different one),
 - the **refill wait** (the gateway says when the window refills, so a short
   wait is cheaper than a reset),
-- the **egress ladder** (proxied path first, then the device's native
-  egress - a dead proxy no longer kills the request),
+- the **egress ladder** (the shared tunnel first, then this instance's own
+  tunnels, then the device's native egress - a dead proxy no longer kills the
+  request, and every leg is a bucket of its own),
 - the **keep-working ceiling** (a request is never abandoned - the relay works
   for up to 4 minutes, then answers a retryable 503),
 - the **no-quota-error rule** (a 429 is never passed on: the caller gets the
@@ -379,8 +380,181 @@ the ceiling is reached, the relay answers **503** with the gateway's own
 keeps running in the background, so the next attempt lands on a fresh
 identity.
 
-### From another machine
+## The tunnel farm
 
+One tunnel is one bucket. **Several tunnels at once are several buckets** -
+as long as they do not collide, and colliding is the hard part.
+
+```bash
+SAJILO_TUNNEL_SLOTS=3 sajilo          # three tunnels of this instance's own
+```
+
+Each slot gets everything to itself:
+
+| | slot 0 | slot 1, 2, ... |
+|---|---|---|
+| registration | `tunnel/config.json` | `tunnel/slot-N/config.json` |
+| proxy port | `SAJILO_TUNNEL_PORT` (40005) | `SAJILO_TUNNEL_PORT + N` |
+| pid file | `state/usque.pid` | `state/usque-N.pid` |
+| logs | `state/usque.log` | `state/usque-N.log` |
+| exit IP | its own | its own |
+
+What the manager (`bin/tunnels.ps1`) refuses to let happen:
+
+- **one registration per tunnel** - a shared config is a shared account, which
+  is a shared exit IP, which is *one* bucket;
+- **one port per tunnel** - a port that is already held is *stepped over*,
+  never adopted: riding somebody else's tunnel means sharing their bucket, and
+  one drained bucket then takes both down with it;
+- **one pid file and one log pair per tunnel** - a shared pid file means
+  rotating one tunnel kills the other;
+- **one exit IP per tunnel** - Cloudflare sometimes hands the same address to
+  two registrations in the same colo, so the address is *measured*: a tunnel
+  that lands on an address another tunnel already has is re-registered until
+  it has one of its own.
+
+The ports are **claimed**, not guessed: a claim file per port says which
+instance owns it, and a claim whose owner is dead can be taken over. The
+claims live in one place for the whole machine
+(`%LOCALAPPDATA%\sajilo`), so two sajilo instances never pick the same port.
+
+The relay climbs the tunnels in order, and **rotates the one it is riding**:
+
+```
+proxy  the shared WARP app      (fast to rotate, shared with the machine)
+alt    this instance's slot 0   (a bucket of this instance's own)
+alt2   this instance's slot 1   (another bucket of this instance's own)
+alt3   this instance's slot 2
+direct the device's own IP
+```
+
+A 429 on one leg says *that* bucket is drained, so the relay climbs to the
+next - and when it does reset, it rotates the leg that answered 429, not a
+tunnel that was fine. Rotating a different tunnel would move a bucket nobody
+is riding and leave the drained one exactly where it was.
+
+### A drained bucket is not a dead request
+
+With one tunnel, one rotation and one mint were enough for the relay to write
+off the whole account - and the caller was told to come back in **hours**. With
+the farm that conclusion is wrong: a drained bucket says nothing about the other
+tunnels, and the gateway's refill time belongs to the bucket that answered, not
+to the account.
+
+So the relay now **walks its buckets**:
+
+```
+proxy  the shared WARP app      (shared with the machine - rotated last)
+alt    this instance's slot 0   -> rotated: a new account, a new exit IP
+alt2   this instance's slot 1   -> rotated: another new bucket
+alt3   this instance's slot 2   -> rotated: another new bucket
+direct the device's own IP
+```
+
+Each rotation is a fresh WARP account on a fresh exit IP, and the **same
+model** is retried on it. The model is only declared spent for the account
+when every tunnel has been rotated *and* a fresh identity did not help - and
+then another free model answers if one is configured.
+
+A wait is only worth it **once** per request: if the window really came back,
+the request is served; another 429 after the wait means the wait did not help,
+and the cure is a fresh bucket, not another wait. (Before this, a gateway that
+kept saying "2 seconds" could hold a request on the same drained bucket for
+the whole budget.)
+
+And the relay tells a drained **bucket** from a closed **window**: if every leg
+reports the *same* refill time, the gateway has one deadline for the whole
+allowance and no tunnel, no exit IP and no rotation can move it - so the relay
+answers with that clock instead of burning a minute of rotations to learn
+nothing. If the clocks differ, each bucket has its own window, and a rotation
+is the cure.
+
+Measured on this machine (Windows, three tunnels, the live gateway):
+
+| leg | verdict |
+|---|---|
+| the WARP app | `200` in 1.5 s |
+| slot 0 | `200` in 1.8 s |
+| slot 1 | `200` in 1.6 s |
+| slot 2 | `503`, `retry-after: 3600` - **that bucket is drained** |
+
+The buckets are per tunnel, so one drained tunnel is one leg the ladder climbs
+over - not a dead session.
+
+### The reserve: a spare bucket, always spun up
+
+A drained bucket is not a dead session, and the tunnel farm exists to make
+that true. There are three things in play:
+
+**1. The working legs.** Every tunnel is up, registered and carrying its own
+exit IP. When one of them answers 429 it is **quarantined** - the ladder stops
+using it, so the next request goes straight to a bucket that has room instead
+of paying a round trip on the drained one.
+
+**2. The reserve.** One tunnel is held **out** of the ladder entirely, so its
+bucket is never spent and stays full. It goes into the ladder the moment a
+working leg is drained - that is the "pick up the backup immediately" part,
+and it costs nothing: the spare tunnel is already up.
+
+**3. The refill.** The drained leg is rotated in the background (a new WARP
+account on a new exit IP is a fresh bucket) while the session keeps running
+on the others. Rotations are serialized - one tunnel at a time, because a
+rotation takes the tunnel down for a few seconds and two at once would take
+two legs away.
+
+When the refilled leg lands it is the **freshest bucket the instance has**, so
+it takes the reserve's place and the leg that was serving as the reserve goes
+back to the working set. That is what makes the guarantee real: **there is
+always exactly one untouched bucket in queue**, and a drain costs one
+rotation, not two.
+
+```
+legs      : proxy, alt, alt2, alt3, direct     <- the reserve is NOT in the ladder
+reserve   : reserve  serving: false
+```
+
+...and when a working leg drains:
+
+```
+SPIN 429 via the alt egress: that bucket is drained - trying the next egress
+REFILL the alt bucket: a new exit IP is back in the ladder
+RESERVE the alt bucket: it is the freshest one now, and it is back in reserve
+```
+
+The gateway's own clock says how long a drained bucket stays quarantined, so
+the relay stops using a leg exactly as long as the gateway says that bucket
+is empty.
+
+| knob | effect |
+|---|---|
+| `SAJILO_TUNNEL_SLOTS` | how many tunnels this instance runs (default 1) |
+| `SAJILO_TUNNEL_RESERVE` | how many of them are held in reserve (default 1). The reserve is never the only tunnel: with one slot, nothing is reserved |
+
+`sajilo doctor` says what is spent and what is being refilled:
+
+```
+relay
+  ok    listening on http://127.0.0.1:43915 (pid 18132, 10 requests served)
+  ok    mode: harness=sajilo tools=sajilo auth=open
+  warn  drained buckets: alt3 - quarantined, and refilled in the background (a new account, a new exit IP, a fresh bucket)
+  ok    refilling now: alt3
+```
+
+`sajilo doctor` says plainly whether any two tunnels share an address:
+
+```
+tunnels
+  ok    slot 0: port 40005 pid 36992 exit 2a09:bac5:4e7f:1a8c::2a5:c2 warp=on (this instance)
+  ok    slot 1: port 40006 pid 27940 exit 2a09:bac5:4e7b:16aa::242:a8 warp=on (this instance)
+  ok    slot 2: port 40007 pid 30988 exit 2a09:bac5:4e78:1aa0::2a7:7d warp=on (this instance)
+```
+
+One honest limit: the **Cloudflare WARP app cannot be duplicated** - it is a
+single Windows service, one proxy port, one registration, and re-registering
+it needs admin rights. The farm is `usque`, which is a user-space client:
+one binary, one config per tunnel, no service, no UAC.
+
+### From another machine
 The relay listens on `127.0.0.1` by default, so it serves this machine (every
 local agent). To serve the network:
 ```bash
@@ -566,6 +740,7 @@ canary: if it ever fails, something rotated a model again.
 | separate HOME, DB, sessions, project | yes | yes |
 | own relay (port 43915) with ladder/budget/reset | yes | yes |
 | own **rotatable** WARP tunnel | yes (`usque`) | yes (`usque` - no admin) |
+| several tunnels at once, isolated from each other | one per instance | yes (`SAJILO_TUNNEL_SLOTS` - the tunnel farm) |
 | egress recovery by rotating the IP | yes | yes - `usque-rotate.cmd` gives a new exit IP, no admin |
 | the live opencode is unaffected | yes | yes |
 
@@ -598,6 +773,10 @@ egress
   ok    proxied leg: http://127.0.0.1:40000 (SAJILO_RELAY_PROXY) - a drained bucket can be climbed over
   ok    exit through the proxy: ip=2a09:bac5:4e79:16aa::242:6b warp=on
   ok    direct exit: ip=2400:1a00:4b26:e77b:19f1:ef89:72ee:8d38 warp=off - a second bucket (via http://127.0.0.1:40001)
+
+tunnels
+  ok    slot 0: port 40005 pid 36992 exit 2a09:bac5:4e7f:1a8c::2a5:c2 warp=on (this instance)
+  ok    slot 1: port 40006 pid 27940 exit 2a09:bac5:4e7b:16aa::242:a8 warp=on (this instance)
 ```
 
 A headless client needs nothing special. The relay runs on its own, without
@@ -621,7 +800,7 @@ OPENAI_BASE_URL=http://127.0.0.1:43915/v1 OPENAI_API_KEY=public my-client
   state/                    logs, reports, pid files, the runtime override files
   mint/                     the scratch dir for identity rotation
   bin/                      the launcher + the tunnel helpers
-  tunnel/                   its own WARP registration (where usque exists)
+  tunnel/                   its own WARP registrations (one per slot)
 ```
 
 Everything is per-instance: the relay port, the proxy, the pins, the mint
@@ -634,7 +813,8 @@ file.
 |---|---|
 | `SAJILO_ROOT` | where the instance lives (default `~/.sajilo`) |
 | `SAJILO_RELAY_PORT` | the relay's port (default 43915) |
-| `SAJILO_TUNNEL_PORT` | the tunnel's proxy port (default 40003) |
+| `SAJILO_TUNNEL_PORT` | the tunnel's proxy port (default 40005) |
+| `SAJILO_TUNNEL_SLOTS` | how many tunnels this instance runs at once (default 1). Each one is a registration, a port and an exit IP of its own - see "The tunnel farm" |
 | `SAJILO_BIN` | the runtime binary to use (default: the pinned opencode) |
 | `SAJILO_NO_DOWNLOAD` | `1` = never download a runtime, fail instead |
 | `SAJILO_FORCE_DOWNLOAD` | `1` = ignore the installed runtime, fetch a private one into the instance |

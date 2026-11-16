@@ -136,9 +136,16 @@ if ($launcherSrc -and (Test-Path $launcherSrc)) {
   }
 }
 if ($Here) {
-  foreach ($f in @("warp-rotate.sh", "tunnel-watchdog.sh", "usque-rotate.ps1", "usque-rotate.cmd", "sajilo-rebrand.sh", "sajilo-rebrand.ps1", "sajilo-relay.ts", "sajilo-doctor.ts")) {
+  foreach ($f in @("warp-rotate.sh", "tunnel-watchdog.sh", "usque-rotate.ps1", "usque-rotate.cmd", "tunnels.ps1", "sajilo-rebrand.sh", "sajilo-rebrand.ps1", "sajilo-relay.ts", "sajilo-doctor.ts")) {
     $p = Join-Path $Here "bin\$f"
     if (Test-Path $p) { Copy-Item $p (Join-Path $BinDir $f) -Force }
+  }
+}
+# A bundle install (a zip download, no clone) carries the same helpers.
+if ($BundleDir) {
+  foreach ($f in @("warp-rotate.sh", "tunnel-watchdog.sh", "usque-rotate.ps1", "usque-rotate.cmd", "tunnels.ps1", "sajilo-rebrand.sh", "sajilo-rebrand.ps1", "sajilo-relay.ts", "sajilo-doctor.ts")) {
+    $p = Join-Path $BundleDir "bin\$f"
+    if ((Test-Path $p) -and -not (Test-Path (Join-Path $BinDir $f))) { Copy-Item $p (Join-Path $BinDir $f) -Force }
   }
 }
 Say "launcher installed -> $BinDir\sajilo.cmd"
@@ -166,10 +173,17 @@ Say "launcher installed -> $BinDir\sajilo.cmd"
 
 $UsqueVersion = "v4.2.1"
 $UsqueBase = "https://github.com/Diniboy1123/usque/releases/download/$UsqueVersion"
-$UsquePort = if ($env:SAJILO_TUNNEL_PORT) { $env:SAJILO_TUNNEL_PORT } else { "40003" }
+# The tunnel port is the LAUNCHER's port (40005), not 40003: the two must
+# agree, or the installer starts a tunnel on one port and the launcher starts
+# another one - two accounts, two buckets, and nobody knows which is which.
+$UsquePort = if ($env:SAJILO_TUNNEL_PORT) { $env:SAJILO_TUNNEL_PORT } else { "40005" }
+$UsqueSlots = if ($env:SAJILO_TUNNEL_SLOTS) { $env:SAJILO_TUNNEL_SLOTS } else { "1" }
+# How many tunnels are held in RESERVE (out of the ladder, their buckets never
+# spent). The reserve can never be the only tunnel.
+$UsqueReserve = if ($env:SAJILO_TUNNEL_RESERVE) { [int]$env:SAJILO_TUNNEL_RESERVE } else { 1 }
+if ($UsqueReserve -ge [int]$UsqueSlots) { $UsqueReserve = [int]$UsqueSlots }
+if ($UsqueReserve -ge 1 -and [int]$UsqueSlots -le 1) { $UsqueReserve = 0 }
 $UsqueBin = Join-Path $BinDir "usque.exe"
-$UsqueConfig = Join-Path $Root "tunnel\config.json"
-$UsqueState = Join-Path $StateDir "usque.pid"
 
 function Test-TcpPort([int]$Port, [int]$TimeoutMs = 800) {
   try {
@@ -214,45 +228,36 @@ function Install-Usque {
   return $true
 }
 
-function Register-Usque {
-  # usque must reach Cloudflare itself: an inherited proxy would send it
-  # through the tunnel it is meant to replace.
-  $env:HTTPS_PROXY = ""; $env:HTTP_PROXY = ""; $env:https_proxy = ""; $env:http_proxy = ""
-  $name = "sajilo-" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+function Start-TunnelFarm {
+  # The tunnels are managed by tunnels.ps1 - ONE implementation, so the
+  # installer and the launcher cannot disagree about the port, the
+  # registration or the pid file. (Two implementations of "start the tunnel"
+  # is exactly how two tunnels end up sharing one account, and one account is
+  # one bucket however many processes hold it.)
+  $manager = Join-Path $BinDir "tunnels.ps1"
+  if (-not (Test-Path $manager)) {
+    Note "tunnel: no tunnel manager at $manager"
+    return $false
+  }
+  if (-not (Test-Path $UsqueBin)) {
+    Note "tunnel: no usque at $UsqueBin"
+    return $false
+  }
   try {
-    # usque writes its progress to STDERR (including a harmless "Config file
-    # not found" on a first run), and this script runs with
-    # ErrorActionPreference=Stop - so stderr would abort the install. The
-    # preference is relaxed around the call and the CONFIG FILE is what
-    # decides whether the registration worked.
     $oldPref = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-      $out = & $UsqueBin register -a -c $UsqueConfig -n $name 2>&1
-      $rc = $LASTEXITCODE
+      $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $manager ensure `
+        -Root $Root -Slots $UsqueSlots -BasePort $UsquePort -SlotsAreAlt 1 -Reserve $UsqueReserve 2>&1
     } finally {
       $ErrorActionPreference = $oldPref
     }
-    if (-not (Test-Path $UsqueConfig)) { throw "register failed (rc=$rc): $out" }
+    $out | ForEach-Object { Write-Host "  $_" }
+    return $true
   } catch {
-    Note "tunnel: usque could not register ($($_.Exception.Message))"
+    Note "tunnel: the tunnel farm did not come up ($($_.Exception.Message))"
     return $false
   }
-  return $true
-}
-
-function Start-Usque {
-  $env:HTTPS_PROXY = ""; $env:HTTP_PROXY = ""; $env:https_proxy = ""; $env:http_proxy = ""
-  $log = Join-Path $StateDir "usque.log"
-  $proc = Start-Process -FilePath $UsqueBin -ArgumentList @(
-    "-c", $UsqueConfig, "http-proxy", "-b", "127.0.0.1", "-p", $UsquePort
-  ) -WindowStyle Hidden -PassThru -RedirectStandardOutput $log -RedirectStandardError "$log.err"
-  $proc.Id | Set-Content $UsqueState -Encoding ascii
-  for ($i = 0; $i -lt 12; $i++) {
-    Start-Sleep -Milliseconds 500
-    if (Test-TcpPort ([int]$UsquePort)) { return $true }
-  }
-  return $false
 }
 
 function Get-TunnelState {
@@ -281,27 +286,22 @@ if ($env:SAJILO_SKIP_TUNNEL -eq "1") {
     Say "tunnel: the Cloudflare WARP app is running (127.0.0.1:40000) - a rotation is a new exit IP"
     "warp-app: http://127.0.0.1:40000" | Set-Content (Join-Path $StateDir "tunnel.txt")
   } else {
-    # No WARP app: bring usque, the user-space WARP client. Installing AND
-    # rotating it needs no administrator rights, no service and no UAC - it
-    # is the fallback that makes the tunnel work everywhere.
-    $haveUsque = Test-Path $UsqueBin
-    if ($haveUsque -and -not (Test-TcpPort ([int]$UsquePort))) {
-      Note "tunnel: usque is installed but not running - starting it"
-      if (-not (Start-Usque)) { $haveUsque = $false }
-    }
-    if (-not $haveUsque) {
-      Note "tunnel: installing usque (a user-space WARP client - no administrator rights, no UAC)"
-      if ((Install-Usque) -and (Register-Usque) -and (Start-Usque)) {
-        $haveUsque = $true
-      }
-    }
-    if ($haveUsque) {
-      Say "tunnel: usque on http://127.0.0.1:$UsquePort - a rotation is a new exit IP, no admin needed"
-      "usque: http://127.0.0.1:$UsquePort" | Set-Content (Join-Path $StateDir "tunnel.txt")
-    } else {
-      Say "tunnel: not available - the relay resets the identity instead (one bucket, not two)"
-      "unavailable" | Set-Content (Join-Path $StateDir "tunnel.txt")
-    }
+    Say "tunnel: no WARP app - bringing usque (no administrator rights, no UAC)"
+  }
+  # The instance's OWN tunnels either way: usque is a user-space WARP client,
+  # so every slot is a registration, a port and an exit IP of its own - a
+  # bucket nobody else on this machine is in. The manager makes sure they do
+  # not collide with each other.
+  if (-not (Test-Path $UsqueBin)) {
+    Note "tunnel: installing usque (a user-space WARP client - no administrator rights, no UAC)"
+    Install-Usque | Out-Null
+  }
+  if (Start-TunnelFarm) {
+    Say "tunnel: $UsqueSlots tunnel(s) of its own, starting from http://127.0.0.1:$UsquePort - a rotation is a new exit IP"
+    "usque: http://127.0.0.1:$UsquePort (x$UsqueSlots, reserve x$UsqueReserve)" | Set-Content (Join-Path $StateDir "tunnel.txt")
+  } else {
+    Say "tunnel: not available - the relay resets the identity instead (one bucket, not two)"
+    "unavailable" | Set-Content (Join-Path $StateDir "tunnel.txt")
   }
 }
 

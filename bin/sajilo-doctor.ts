@@ -79,6 +79,28 @@ try {
   health = await r.json()
   ok(`listening on ${BASE} (pid ${health.pid}, ${health.hits} requests served)`)
   ok(`mode: harness=${health.harness} tools=${health.tools} auth=${health.auth}`)
+  // The reserve: which buckets are drained (quarantined) and which tunnels are
+  // being refilled right now.
+  const legs = (health.legDetails ?? []) as Array<{ name: string; spent?: boolean }>
+  const spent = legs.filter((l) => l.spent).map((l) => l.name)
+  const refilling = (health.refilling ?? []) as string[]
+  if (legs.length === 0) {
+    // An older relay: it does not report the buckets' health yet.
+  } else if (spent.length === 0) {
+    ok("every bucket has room - no drained leg")
+  } else {
+    warn(
+      `drained buckets: ${spent.join(", ")} - quarantined, and refilled in the background ` +
+        `(a new account, a new exit IP, a fresh bucket)`,
+    )
+  }
+  if (refilling.length > 0) ok(`refilling now: ${refilling.join(", ")}`)
+  if (health?.reserve) {
+    ok(
+      `reserve: ${health.reserve}` +
+        `${health.reserveServing ? " (serving - a working leg was drained)" : " (held back - its bucket is never spent)"}`,
+    )
+  }
 } catch {
   bad(`no relay on ${BASE} - start one with: sajilo relay`)
 }
@@ -343,6 +365,69 @@ if (native.ip) {
       `on Bun < 1.4 NO_PROXY is ignored, so the direct leg stays in the tunnel unless ` +
       `SAJILO_RELAY_DIRECT_PROXY names a proxy that connects directly`,
   )
+}
+
+// --- the tunnels -------------------------------------------------------------
+// Every WARP tunnel on this machine is a quota bucket of its own - but only
+// if they do not COLLIDE. Two tunnels that landed on one exit IP are ONE
+// bucket, however many processes they are, and one drained bucket then takes
+// both down with it. So this section lists every tunnel and says plainly
+// whether any two of them share an address.
+console.log("\ntunnels")
+const registryPath = join(
+  process.env.LOCALAPPDATA ?? join(process.env.HOME ?? ".", ".local", "share"),
+  "sajilo",
+  "tunnels.json",
+)
+const alive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    // EPERM means it is there and we may not signal it.
+    return (e as { code?: string })?.code === "EPERM"
+  }
+}
+try {
+  const registry = JSON.parse(readFileSync(registryPath, "utf8")) as {
+    tunnels?: Array<{
+      port: number
+      root: string
+      slot: number
+      pid: number
+      exitIp?: string
+    }>
+  }
+  const tunnels = registry.tunnels ?? []
+  if (tunnels.length === 0) {
+    warn("no tunnels registered - the launcher has not started the farm")
+  }
+  // The exit IP of every tunnel, measured live: a registered address can be
+  // stale (the tunnel may have been rotated since it was written down).
+  const seen = new Map<string, string>()
+  for (const t of tunnels.slice(0, 8)) {
+    const mine = t.root === ROOT
+    const up = alive(t.pid)
+    const probe = await exitThrough(`http://127.0.0.1:${t.port}`)
+    const ip = probe.ip ?? t.exitIp ?? "?"
+    const where = mine ? "this instance" : "another instance"
+    if (!up) {
+      warn(`slot ${t.slot}: port ${t.port} is not running (pid ${t.pid}) - a dead leg is not a bucket`)
+      continue
+    }
+    ok(`slot ${t.slot}: port ${t.port} pid ${t.pid} exit ${ip} warp=${probe.warp ?? "?"} (${where})`)
+    const other = seen.get(ip)
+    if (other) {
+      warn(
+        `slots ${other} and ${t.slot} share the exit IP ${ip} - that is ONE bucket, ` +
+          `not two. Rotating one of them (sajilo tunnels) separates them.`,
+      )
+    } else {
+      seen.set(ip, String(t.slot))
+    }
+  }
+} catch (e) {
+  warn(`no tunnel registry (${registryPath}) - the launcher has not started the farm yet`)
 }
 
 // --- the reset record --------------------------------------------------------

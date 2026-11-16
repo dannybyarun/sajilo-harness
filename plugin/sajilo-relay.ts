@@ -696,8 +696,15 @@ function instanceUsqueRotator(): string | undefined {
  * registration and is back in seconds. The identity (the mint) is the slow
  * leg, so they are kicked separately and the caller retries as soon as the
  * fast one is done.
+ *
+ * The leg matters: the rotator has to move the bucket the relay is actually
+ * riding. Rotating the shared WARP app while the relay sits on one of the
+ * instance's own tunnels changes nothing - the reset then "succeeds" without
+ * moving the bucket. And rotating "whichever tunnel" is not good enough
+ * either: with several tunnels up, that would move a bucket nobody is using
+ * and leave the drained one in place. So the leg's own slot is rotated.
  */
-async function performEgressRotation(reason: string): Promise<boolean> {
+async function performEgressRotation(reason: string, leg?: Egress): Promise<boolean> {
   if (!egressRotationEnabled()) return false
   // The rotator is per-instance: the sajilo instance must rotate ITS OWN
   // tunnel. A hardcoded path meant sajilo's rescue chain rotated the LIVE
@@ -707,13 +714,29 @@ async function performEgressRotation(reason: string): Promise<boolean> {
   // usque existed, and it is fast (measured: 6.8 s). The instance's own
   // usque rotator is the admin-free alternative (no service, no UAC).
   const isWindows = process.platform === "win32"
-  const ROTATOR = isWindows
-    ? (env("RELAY_ROTATOR") ??
-      (existsSync(`${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`)
-        ? `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`
-        : instanceUsqueRotator()) ??
-      `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`)
-    : (env("RELAY_ROTATOR") ?? "/usr/local/lib/opencode-warp/warp-rotate.sh")
+  const appRotator = `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\warp-rotate.cmd`
+  const target = leg ? egressLegByName(leg) : undefined
+  const slotArgs: string[] = []
+  const explicit = env("RELAY_ROTATOR")
+  const usqueRotator = instanceUsqueRotator()
+  let ROTATOR: string
+  if (target?.owned && target.slot !== null) {
+    // This instance's own tunnel: rotate THIS slot, so no sibling tunnel is
+    // touched and the bucket that is actually drained is the one that moves.
+    // The instance's own rotator wins over an inherited one here: rotating a
+    // DIFFERENT tunnel would move a bucket nobody is using and leave the
+    // drained one exactly where it was.
+    ROTATOR = usqueRotator ?? explicit ?? appRotator
+    slotArgs.push("--slot", String(target.slot))
+  } else {
+    // The shared WARP app's rotator: fast (measured: 6.8 s). It was working
+    // before usque existed. The instance's own usque rotator is the
+    // admin-free alternative (no service, no UAC).
+    ROTATOR = explicit ??
+      (isWindows
+        ? (existsSync(appRotator) ? appRotator : usqueRotator ?? appRotator)
+        : "/usr/local/lib/opencode-warp/warp-rotate.sh")
+  }
   const RESCUE_LOG = env("RELAY_RESCUE_LOG") ?? "/tmp/sajilo/rescue.log"
   const transcript = (line: string) => {
     try {
@@ -730,7 +753,7 @@ async function performEgressRotation(reason: string): Promise<boolean> {
     // Restart first on unix (cheap, keeps the working account); Windows has
     // only --rotate-only, which replaces the registration.
     const attempts = isWindows
-      ? [[ROTATOR, "--rotate-only"]]
+      ? [[ROTATOR, "--rotate-only", ...slotArgs]]
       : [
           [ROTATOR, "--restart-only"],
           [ROTATOR, "--rotate-only"],
@@ -845,9 +868,75 @@ async function performMint(reason: string): Promise<ResetResult> {
 let egressInFlight: Promise<boolean> | null = null
 let identityMintInFlight: Promise<ResetResult> | null = null
 
-function rotateEgress(reason: string): Promise<boolean> {
+// The rotations that are running right now, per leg. A rotation takes the
+// tunnel DOWN for a few seconds, so they are serialized: one at a time, one
+// leg at a time. The request path and the background refill both go through
+// here, so a slot is never rotated twice at once.
+const pendingRotations = new Map<Egress, Promise<boolean>>()
+let rotationChain: Promise<unknown> = Promise.resolve()
+
+function rotateLeg(leg: Egress, reason: string): Promise<boolean> {
+  const running = pendingRotations.get(leg)
+  if (running) return running
+  const p = rotationChain.then(async () => {
+    const wasSpent = spentLegs.has(leg)
+    const ok = await performEgressRotation(reason, leg)
+    // A landed rotation is a new exit IP, so the bucket is fresh again.
+    if (ok) {
+      spentLegs.delete(leg)
+      if (wasSpent && leg !== reserveLeg) {
+        // The refilled leg is now the freshest bucket this instance has, so
+        // it takes the reserve's place: the leg that was serving as the
+        // reserve goes back to the working set. That is what keeps ONE
+        // untouched bucket in queue at all times - and it costs one rotation
+        // per drain, not two.
+        reserveLeg = leg
+        reserveServing = false
+        logActivity(
+          `[${new Date().toISOString()}] RESERVE the ${leg} bucket: it is the freshest one now, and it is back in reserve`,
+        )
+      }
+    }
+    return ok
+  })
+  // The chain must not break when a rotation fails.
+  rotationChain = p.then(
+    () => {},
+    () => {},
+  )
+  pendingRotations.set(leg, p)
+  p.finally(() => {
+    if (pendingRotations.get(leg) === p) pendingRotations.delete(leg)
+  })
+  return p
+}
+
+/**
+ * Refill a drained bucket in the background.
+ *
+ * Only the tunnels of THIS instance are refilled: a slot is rotated (a new
+ * WARP account on a new exit IP), and the session keeps running on the other
+ * tunnels meanwhile. The shared WARP app is left alone - it belongs to the
+ * whole machine, not to this instance.
+ */
+function refillSpentLeg(leg: Egress): void {
+  const l = egressLegByName(leg)
+  if (!l || !l.owned || l.slot === null) return
+  if (pendingRotations.has(leg)) return // a refill is already running
+  void rotateLeg(leg, `refill-${leg}`).then((ok) => {
+    if (ok) {
+      logActivity(
+        `[${new Date().toISOString()}] REFILL the ${leg} bucket: a new exit IP is back in the ladder`,
+      )
+    }
+  })
+}
+
+function rotateEgress(reason: string, leg?: Egress): Promise<boolean> {
   if (egressInFlight) return egressInFlight
-  const p = performEgressRotation(reason).finally(() => {
+  const target = leg ?? rotationTarget([])
+  if (!target) return Promise.resolve(false)
+  const p = rotateLeg(target, reason).finally(() => {
     if (egressInFlight === p) egressInFlight = null
   })
   egressInFlight = p
@@ -900,6 +989,45 @@ function killProcessTree(proc: { pid: number; kill: () => void }): void {
 }
 
 /**
+ * A server whose owner is gone is an orphan, and an orphan keeps the port.
+ *
+ * The owner is the opencode process that loaded this plugin. When it exits -
+ * the TUI closed, the one-shot run finished - the server it left behind would
+ * keep the relay's port, and the next instance would find the port busy and
+ * ADOPT the relay that is already there: the OLD build. That is why an edit
+ * sometimes looked like it had done nothing.
+ *
+ * So the server watches its owner, and releases the port when the owner goes.
+ */
+function startParentGuard(): void {
+  const owner = process.ppid
+  if (!owner || owner <= 1) return
+  const alive = (pid: number): boolean => {
+    try {
+      // Signal 0 is the "does it exist" check: it does not signal anything.
+      process.kill(pid, 0)
+      return true
+    } catch (e) {
+      // EPERM means it is there but we may not signal it.
+      return (e as { code?: string }).code === "EPERM"
+    }
+  }
+  const timer = setInterval(() => {
+    if (alive(owner)) return
+    logActivity(
+      `[${new Date().toISOString()}] OWNER-GONE pid=${owner} - the instance that owned the relay is gone; releasing the port`,
+    )
+    try {
+      server?.stop(true)
+    } catch {
+      /* ignore */
+    }
+    process.exit(0)
+  }, 5_000)
+  unrefTimer(timer)
+}
+
+/**
  * Start a full reset (both legs), or join the one that is already running.
  * The promise settles when the fresh identity is in place.
  *
@@ -908,7 +1036,7 @@ function killProcessTree(proc: { pid: number; kill: () => void }): void {
  * egress was not enough. This is for the paths that have no request to
  * retry - the egress-unreachable repair.
  */
-function startReset(reason: string): Promise<ResetResult> {
+function startReset(reason: string, leg?: Egress): Promise<ResetResult> {
   if (env("RELAY_AUTOMINT") === "0") {
     return Promise.resolve({
       ok: false,
@@ -929,7 +1057,7 @@ function startReset(reason: string): Promise<ResetResult> {
   }
   lastResetAt = Date.now()
   const p = (async () => {
-    await rotateEgress(reason)
+    await rotateEgress(reason, leg)
     return await mintIdentity(reason)
   })()
   resetInFlight = p
@@ -1227,6 +1355,43 @@ async function fetchUpstream(
 }
 
 /**
+ * The buckets' health.
+ *
+ * A leg that answered 429 has a drained bucket. Two things follow, and both
+ * matter for how a session feels:
+ *
+ * 1. it is QUARANTINED - the ladder stops using it, so the next request goes
+ *    straight to a bucket that has room instead of paying a round trip on
+ *    drained one. That is the "pick up the backup immediately" part, and it
+ *    is free: the spare tunnel is already up, already registered and already
+ *    carrying its own exit IP.
+ * 2. it is REFILLED in the background - the slot is rotated (a new WARP
+ *    account on a new exit IP is a fresh bucket) while the session keeps
+ *    running on the others. That is the "keep a spare spun up" part: the
+ *    farm always has one in reserve, and the reserve is being refilled all
+ *    the time.
+ *
+ * The gateway's own clock is the truth about when a bucket is back, so the
+ * quarantine lasts exactly as long as the Retry-After it reported.
+ */
+const spentLegs = new Map<Egress, number>()
+
+function markLegSpent(leg: Egress, refillInSeconds: number): void {
+  const wait = Math.min(Math.max(refillInSeconds, 30) * 1000, 6 * 60 * 60 * 1000)
+  spentLegs.set(leg, Date.now() + wait)
+}
+
+function isLegSpent(leg: Egress): boolean {
+  const until = spentLegs.get(leg)
+  if (until === undefined) return false
+  if (Date.now() >= until) {
+    spentLegs.delete(leg)
+    return false
+  }
+  return true
+}
+
+/**
  * The egress legs, in the order the relay climbs them.
  *
  * - "proxy"  : the shared tunnel (the Cloudflare WARP app). Fast to rotate -
@@ -1236,32 +1401,216 @@ async function fetchUpstream(
  *              this instance alone, so it is a bucket nobody else is in.
  *              Rotating it takes minutes, so it is the second leg, not the
  *              first.
+ * - "alt2", "alt3", ... : the instance's SECOND, third, ... tunnels. Each one
+ *              is a registration of its own, on a port of its own, with an
+ *              exit IP of its own - so each one is a bucket of its own, and
+ *              a drained one never takes its siblings down with it.
  * - "direct" : the device's own IP. The last resort.
  *
  * A 429 from one leg says THAT bucket is drained, not that the model is -
  * which is exactly why the ladder exists.
  */
-type Egress = "proxy" | "alt" | "direct"
+type Egress = string
+
+interface EgressLeg {
+  /** The leg's name: "proxy", "alt", "alt2", ... , "direct". */
+  name: Egress
+  /** The proxy URL for this leg. null = the device's own egress. */
+  proxy: string | null
+  /** The instance tunnel slot this leg rides. null for the shared app/direct. */
+  slot: number | null
+  /** The instance owns this leg, so the instance's own rotator can move it. */
+  owned: boolean
+  /**
+   * This leg is the RESERVE: it is kept OUT of the ladder while the working
+   * legs have room, so its bucket is never touched and stays fresh. The
+   * moment a working leg is drained, the reserve goes into the ladder and
+   * serves - and the leg that is refilled takes the reserve's place. That is
+   * the "always one extra in queue" part: there is always a bucket that has
+   * not been spent.
+   */
+  reserve?: boolean
+}
+
+/**
+ * The instance's OWN tunnels, in slot order.
+ *
+ * Slot 0 is the historical one ("alt"). The extra slots arrive as a list:
+ * the launcher knows which port each slot ended up on (a port can move when
+ * something else already holds it), and it hands the relay the list.
+ */
+function instanceTunnelLegs(): EgressLeg[] {
+  const legs: EgressLeg[] = []
+  const alt = env("RELAY_PROXY_ALT")
+  if (alt) {
+    // The alt leg is the instance's own tunnel only when it says which slot it
+    // is. Without a slot id it is somebody else's tunnel (on unix it is the
+    // shared WARP app), and rotating it with the instance's own rotator would
+    // move a bucket nobody is riding.
+    const raw = env("RELAY_PROXY_ALT_SLOT")
+    const slot = raw === undefined ? NaN : Number(raw)
+    legs.push({
+      name: "alt",
+      proxy: alt,
+      slot: Number.isFinite(slot) ? slot : null,
+      owned: Number.isFinite(slot),
+    })
+  }
+  const more = (env("RELAY_PROXY_ALTS") ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const slots = (env("RELAY_PROXY_ALT_SLOTS") ?? "").split(",").map((s) => s.trim())
+  more.forEach((proxy, i) => {
+    const slot = Number(slots[i] ?? i + 1)
+    legs.push({
+      name: `alt${i + 2}`,
+      proxy,
+      slot: Number.isFinite(slot) ? slot : i + 1,
+      owned: true,
+    })
+  })
+  // The RESERVE: a tunnel that is kept out of the ladder while the working
+  // legs have room, so its bucket is never spent. It is the "one extra in
+  // queue" - it goes into the ladder the moment a working leg is drained.
+  const reserve = env("RELAY_PROXY_RESERVE")
+  if (reserve) {
+    const raw = env("RELAY_PROXY_RESERVE_SLOT")
+    const slot = raw === undefined ? NaN : Number(raw)
+    legs.push({
+      name: "reserve",
+      proxy: reserve,
+      slot: Number.isFinite(slot) ? slot : null,
+      owned: Number.isFinite(slot),
+      reserve: true,
+    })
+  }
+  return legs
+}
+
+/**
+ * The reserve: the leg that is held out of the ladder so its bucket stays
+ * fresh.
+ *
+ * The role MOVES: when a drained leg is refilled, that leg is the freshest
+ * bucket this instance has, so it takes the reserve's place and the reserve
+ * goes back to serving. That way there is always exactly one untouched
+ * bucket in queue, and a drain costs ONE rotation - not two.
+ */
+let reserveLeg: Egress | null = null
+let reserveServing = false
+
+function currentReserve(): Egress | null {
+  if (reserveLeg) return reserveLeg
+  const r = egressLegs().find((l) => l.reserve)
+  reserveLeg = r?.name ?? null
+  return reserveLeg
+}
+
+/**
+ * The whole ladder, as data. The relay climbs it in order, and the rotator
+ * rotates the leg it is actually riding.
+ */
+function egressLegs(): EgressLeg[] {
+  const legs: EgressLeg[] = []
+  const primary = env("RELAY_PROXY")
+  if (primary) {
+    // The primary leg is usually the shared WARP app. But on a machine
+    // without it, the primary is this instance's OWN tunnel - and the relay
+    // has to know that, or a reset would rotate somebody else's tunnel.
+    const raw = env("RELAY_PROXY_SLOT")
+    const slot = raw === undefined ? NaN : Number(raw)
+    legs.push({
+      name: "proxy",
+      proxy: primary,
+      slot: Number.isFinite(slot) ? slot : null,
+      owned: Number.isFinite(slot),
+    })
+  }
+  legs.push(...instanceTunnelLegs())
+  if (!directEgressEnabled()) legs.push({ name: "direct", proxy: null, slot: null, owned: false })
+  return legs
+}
+
+function egressLegByName(name: Egress): EgressLeg | undefined {
+  return egressLegs().find((l) => l.name === name)
+}
 
 /**
  * The egress ladder for one attempt: the proxied path first, then the
- * instance's own tunnel, then the device's native egress. When the
+ * instance's own tunnels, then the device's native egress. When the
  * direct-egress flag is set, the proxy is skipped entirely.
  */
 function egressLadder(): Egress[] {
   if (directEgressEnabled()) return ["direct"]
-  const legs: Egress[] = ["proxy"]
-  if (env("RELAY_PROXY_ALT")) legs.push("alt")
-  legs.push("direct")
-  return legs
+  const reserve = currentReserve()
+  const all = egressLegs().map((l) => l.name)
+  // A leg whose bucket is drained goes LAST: it is still a bucket (its window
+  // may come back on its own), but it must never be the first thing a
+  // request tries. The healthy legs come first - that is the "pick up the
+  // backup immediately" part, and it costs nothing: the spare is already up.
+  const spent = all.filter((n) => n !== reserve && isLegSpent(n))
+  const healthy = all.filter((n) => n !== reserve && !isLegSpent(n))
+  // The RESERVE stays out of the ladder while the working legs have room, so
+  // its bucket is never spent. It goes in the moment a working leg is
+  // drained - that is the "pick up the backup immediately" moment - and it
+  // stays in until a refilled leg takes the reserve's place.
+  const includeReserve = reserve !== null && (spent.length > 0 || reserveServing)
+  if (includeReserve && reserve !== null) reserveServing = true
+  return [...healthy, ...(includeReserve && reserve ? [reserve] : []), ...spent]
 }
 
 /**
  * The proxy URL for one leg, or null for the direct leg.
  */
 function proxyForLeg(egress: Egress): string | null {
-  if (egress === "direct") return null
-  return egress === "alt" ? (env("RELAY_PROXY_ALT") ?? null) : (env("RELAY_PROXY") ?? null)
+  const leg = egressLegByName(egress)
+  if (!leg) return null
+  return leg.proxy
+}
+
+/**
+ * The leg a reset should rotate.
+ *
+ * The rotator has to match the leg the relay is RIDING: rotating the WARP app
+ * while the relay rides its own tunnel changes nothing at all, and the reset
+ * then "succeeds" without moving the bucket.
+ *
+ * A leg this instance owns wins - rotating it moves this instance's bucket
+ * and touches no sibling tunnel. The shared app is the fallback.
+ *
+ * And with more than one tunnel, the tunnels are tried in turn: each one that
+ * has not been rotated yet is a bucket that has not been spent, and a
+ * rotation is a new account on a new exit IP. Only when every tunnel of this
+ * instance has been rotated does the drained one get another turn.
+ */
+function rotationTarget(drained: string[], rotated?: Set<Egress>): Egress | undefined {
+  const owned = egressLegs().filter((l) => l.owned)
+  // A tunnel whose bucket is drained is the one that needs a new account.
+  for (const name of drained) {
+    const leg = egressLegByName(name)
+    if (leg?.owned && isLegSpent(name)) return name
+  }
+  // A tunnel this request has not rotated yet.
+  for (const name of drained) {
+    const leg = egressLegByName(name)
+    if (leg?.owned && !rotated?.has(name)) return name
+  }
+  for (const leg of owned) {
+    if (!rotated?.has(leg.name)) return leg.name
+  }
+  // Every tunnel of ours has been rotated once: rotate the drained one again
+  // - a new account is a new bucket, so it is still worth a turn.
+  for (const name of drained) {
+    const leg = egressLegByName(name)
+    if (leg?.owned) return name
+  }
+  // Nothing of ours is left: the shared tunnel, if it is in the ladder.
+  for (const name of drained) {
+    const leg = egressLegByName(name)
+    if (leg && !leg.owned && leg.name !== "direct") return name
+  }
+  return owned[0]?.name
 }
 
 /**
@@ -1667,8 +2016,30 @@ function startServer(): void {
             // instance's own tunnel (a bucket of its own), the last is the
             // device's own IP.
             legs: egressLadder(),
+            legDetails: egressLegs().map((l) => ({
+              name: l.name,
+              proxy: l.proxy,
+              slot: l.slot,
+              owned: l.owned,
+              // A drained bucket is quarantined until the gateway's own clock
+              // says it is back - and refilled in the background meanwhile.
+              spent: isLegSpent(l.name),
+              spentUntil: spentLegs.get(l.name) ?? null,
+            })),
+            // The tunnels that are being refilled right now (a new WARP
+            // account, a new exit IP, a fresh bucket).
+            refilling: [...pendingRotations.keys()],
+            // The reserve: the leg held out of the ladder so its bucket is
+            // never spent. It is brought in the moment a working leg is
+            // drained.
+            reserve: currentReserve(),
+            reserveServing,
             proxy: env("RELAY_PROXY") ?? null,
             proxyAlt: env("RELAY_PROXY_ALT") ?? null,
+            proxyAlts: (env("RELAY_PROXY_ALTS") ?? "")
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean),
           })
         }
         // A token, when set, is required on everything but the health probe.
@@ -1936,13 +2307,43 @@ function startServer(): void {
           const spinStarted = Date.now()
           let fetchErrors = 0
           let resets = 0
+          // How many times this request has waited out a refill. A wait is
+          // only worth it ONCE: if the window really came back, the request
+          // would have been served. Another 429 after the wait means the wait
+          // did not help - and the cure then is a fresh bucket, not another
+          // wait. (Before this, a gateway that keeps saying "2s" could keep
+          // the request waiting forever, on the same drained bucket.)
+          let shortWaits = 0
           // The two legs of a reset, per request: the egress (fast) and the
           // identity (slow). The egress is tried first and the identity runs
           // alongside it, so the caller retries the SAME model within seconds
           // instead of waiting a minute for a mint.
-          let egressRotated = false
+          //
+          // The egress leg is a ROTATION OF A TUNNEL: a new WARP account on a
+          // new exit IP, which is a bucket of its own. With more than one
+          // tunnel, each tunnel that has not been rotated yet is another
+          // fresh bucket - so the request keeps working through them instead
+          // of giving up after the first one.
           let egressPending: Promise<boolean> | null = null
           let mintPending: Promise<ResetResult> | null = null
+          // The legs this request has already rotated. Each rotation is a new
+          // bucket, so a leg that has been rotated is a bucket that has been
+          // spent - the next one is the cure.
+          const rotatedLegs = new Set<Egress>()
+          // The legs that answered 429 during this request: those buckets are
+          // the drained ones, so the reset rotates one of THEM - not a tunnel
+          // that is fine.
+          const drainedEgress: string[] = []
+          // The leg the last attempt used - the one whose 429 is handled
+          // after the ladder loop ends.
+          let lastEgress: Egress = "proxy"
+          // The refill time each drained leg reported. This is what tells a
+          // drained BUCKET from a closed WINDOW: if every leg reports the
+          // same clock, the window is shared - one deadline for the whole
+          // allowance - and no tunnel, no exit IP and no rotation can move
+          // it. If the clocks differ, each bucket has its own window, and a
+          // rotation is the cure.
+          const drainedRefills = new Map<Egress, number>()
           // Did the identity mint land? Once it has, a further 429 means the
           // model is empty for the whole account - not for this identity.
           let mintSettled = false
@@ -1974,6 +2375,7 @@ function startServer(): void {
             // flight) must not kill the request - the native egress is an
             // independent quota bucket and can still serve it.
             for (const egress of egressLadder()) {
+              lastEgress = egress
               try {
                 resp = await fetchUpstream(
                   target,
@@ -1994,6 +2396,16 @@ function startServer(): void {
                   logActivity(
                     `[${new Date().toISOString()}] SPIN 429 via the ${egress} egress (${wanted}): that bucket is drained - trying the next egress`,
                   )
+                  if (!drainedEgress.includes(egress)) drainedEgress.push(egress)
+                  const legRefill = retryAfterSeconds(resp.headers.get("retry-after"))
+                  if (legRefill > 0) drainedRefills.set(egress, legRefill)
+                  // This bucket is drained too: quarantine it (the ladder
+                  // will not start with it again) and refill it in the
+                  // background. Without this the ladder keeps coming back
+                  // to the same empty bucket on every attempt.
+                  const wasSpent = isLegSpent(egress)
+                  markLegSpent(egress, legRefill)
+                  if (!wasSpent) refillSpentLeg(egress)
                   try {
                     await resp.body?.cancel()
                   } catch {
@@ -2001,6 +2413,9 @@ function startServer(): void {
                   }
                   resp = null
                   continue
+                }
+                if (resp.status === 429 && !drainedEgress.includes(egress)) {
+                  drainedEgress.push(egress)
                 }
                 break
               } catch (e) {
@@ -2033,7 +2448,7 @@ function startServer(): void {
                     `[${new Date().toISOString()}] SPIN every egress unreachable (${fetchErrors} fetch errors) - repairing the egress and trying again`,
                   )
                   fetchErrors = 0
-                  void startReset("egress-unreachable")
+                  void startReset("egress-unreachable", rotationTarget(drainedEgress))
                   await Bun.sleep(5_000)
                   continue outer
                 }
@@ -2084,6 +2499,7 @@ function startServer(): void {
                 )
                 break outer
               }
+              if (refillIn > 0) drainedRefills.set(lastEgress, refillIn)
               const remaining = KEEP_WORKING_MS - (Date.now() - spinStarted)
               if (remaining <= 0) break outer
               // The gateway told us when the window refills. If that is soon
@@ -2102,13 +2518,119 @@ function startServer(): void {
                 fits &&
                 refillIn > WAIT_MAX_SECONDS &&
                 refillIn <= LONG_WAIT_MAX_SECONDS
-              if (mintSettled) {
-                // A fresh egress AND a fresh identity did not help: the model
-                // is empty for the WHOLE ACCOUNT, not for this identity, and
-                // no rotation can change that. Spinning for the rest of the
-                // budget would only burn the caller's time - so either wait
-                // for the gateway's own refill (if it is near) or answer with
-                // it, which is the truth.
+              // The bucket that answered is drained. Quarantine it - the
+              // ladder will not use it again until it is fresh - and refill
+              // it in the background. The session keeps running on the other
+              // tunnels meanwhile: that is the backup being picked up, and
+              // the spare being kept ready.
+              //
+              // The refill happens ONCE per drain: a leg that is already
+              // quarantined has a refill running (or one that just landed),
+              // and rotating it again would be a storm.
+              const wasSpent = isLegSpent(lastEgress)
+              markLegSpent(lastEgress, refillIn)
+              if (!wasSpent) refillSpentLeg(lastEgress)
+              // One clock or many? When every leg that answered reports the
+              // SAME refill time, the window is shared - the gateway has one
+              // deadline for the whole allowance, and it is the same deadline
+              // from every exit IP (measured: the WARP app, three tunnels and
+              // the machine's own IP all reported the same second). Rotating
+              // a tunnel cannot move that, and pretending otherwise would
+              // burn a minute of the caller's time to learn nothing.
+              const refills = [...drainedRefills.values()].filter((v) => v > 0)
+              const sharedWindow =
+                refills.length >= 2 && refills.every((v) => Math.abs(v - refills[0]) <= 120)
+              if (sharedWindow && !(shortWait && shortWaits < 1)) {
+                logActivity(
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: every bucket reports the SAME refill time (${refills[0]}s) - the window is shared, not per tunnel, so no rotation can move it`,
+                )
+                // Another free model may have its own window, so try it before
+                // answering - and if it does not, the answer is the gateway's
+                // clock, which is the truth.
+                if (fallbackIndex + 1 < fallbacks.length) {
+                  fallbackIndex++
+                  wanted = fallbacks[fallbackIndex]
+                  requestedModel = wanted
+                  mintSettled = false
+                  shortWaits = 0
+                  rotatedLegs.clear()
+                  drainedRefills.clear()
+                  logActivity(
+                    `[${new Date().toISOString()}] SPIN 429 on ${originModel}: the window is shared - falling back to ${wanted}`,
+                  )
+                  continue
+                }
+                logActivity(
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window is shared by every bucket and no model can be served - answering with the gateway's own clock (${refills[0]}s) instead of spinning`,
+                )
+                break outer
+              }
+              if (shortWait && shortWaits < 1) {
+                shortWaits++
+                logActivity(
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window refills in ${refillIn}s - waiting it out (no reset)`,
+                )
+                await Bun.sleep(waitMs)
+                continue
+              }
+              // Is there a bucket with room left? Then use it RIGHT NOW: the
+              // ladder starts with the healthy legs, so the next attempt goes
+              // straight to the spare and the caller waits for nothing but
+              // the round trip.
+              const backup = egressLadder().filter((n) => n !== "direct" && !isLegSpent(n))
+              if (backup.length > 0) {
+                logActivity(
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the ${lastEgress} bucket is drained - taking the ${backup[0]} bucket instead (it is already up)`,
+                )
+                continue
+              }
+              // Every bucket of ours is drained. The refills run in the
+              // background - wait for one of them to land and retry on it.
+              const pending = [...pendingRotations.values()]
+              if (pending.length > 0) {
+                const raced = await Promise.race([
+                  Promise.all(pending).then(() => ({ timedOut: false })),
+                  Bun.sleep(Math.max(0, remaining)).then(() => ({ timedOut: true })),
+                ])
+                if (raced.timedOut) {
+                  logActivity(
+                    `[${new Date().toISOString()}] SPIN ceiling reached while the buckets were being refilled - answering with a retryable 503`,
+                  )
+                  break outer
+                }
+                logActivity(
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: a bucket has been refilled - trying it (the same model, a new exit IP)`,
+                )
+                continue
+              }
+              // A rotation is already in flight: wait for it to land (it takes
+              // seconds - a new registration and a restart) and then retry on
+              // the fresh bucket. Rotating a second tunnel while the first
+              // one is still coming up would only take another leg away.
+              if (egressPending) {
+                const raced = await Promise.race([
+                  egressPending.then(() => ({ timedOut: false })),
+                  Bun.sleep(Math.max(0, remaining)).then(() => ({ timedOut: true })),
+                ])
+                if (raced.timedOut) {
+                  logActivity(
+                    `[${new Date().toISOString()}] SPIN ceiling reached while the egress was rotating - answering with a retryable 503`,
+                  )
+                  break outer
+                }
+                // The rotation has landed: clear it, so the NEXT 429 rotates
+                // the NEXT tunnel - a different bucket - instead of waiting on
+                // this one again.
+                egressPending = null
+                logActivity(
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the egress has rotated - trying the fresh bucket (the same model, a new exit IP)`,
+                )
+                continue
+              }
+              if (mintSettled && backup.length === 0 && pending.length === 0) {
+                // Every bucket this instance has is drained, every refill has
+                // landed and the identity is fresh: now - and only now - the
+                // model really is spent for every bucket we have.
                 if (longWait) {
                   logActivity(
                     `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window refills in ${refillIn}s - waiting it out`,
@@ -2123,9 +2645,14 @@ function startServer(): void {
                   fallbackIndex++
                   wanted = fallbacks[fallbackIndex]
                   requestedModel = wanted
-                  // The new model gets its own reset cycle.
-                  egressRotated = false
+                  // The new model gets its own reset cycle - and its own
+                  // buckets: an allowance is per model, so the tunnels are
+                  // worth rotating again for it.
                   mintSettled = false
+                  shortWaits = 0
+                  rotatedLegs.clear()
+                  spentLegs.clear()
+                  drainedRefills.clear()
                   logActivity(
                     `[${new Date().toISOString()}] SPIN 429 on ${originModel}: the model is spent for the whole account - falling back to ${wanted}`,
                   )
@@ -2133,20 +2660,16 @@ function startServer(): void {
                 }
                 logActivity(
                   `[${new Date().toISOString()}] SPIN 429 on ${wanted}: ` +
-                    `${mintChanged ? "a fresh egress and a fresh identity did not help - the model is empty for the whole account" : "the reset did not change the identity, so the same window came back"}` +
+                    `${mintChanged ? "every bucket was refilled and a fresh identity did not help - the model is empty for the whole account" : "the reset did not change the identity, so the same window came back"}` +
                     `${refillIn > 0 ? ` (the next model frees up in ${refillIn}s)` : ""}. Answering with that time instead of spinning.`,
                 )
                 break outer
               }
-              if (shortWait) {
-                logActivity(
-                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window refills in ${refillIn}s - waiting it out (no reset)`,
-                )
-                await Bun.sleep(waitMs)
-                continue
-              }
-              // The window for THIS identity is empty. Reset it - a new egress
-              // and a new session/project pair - and retry the SAME model.
+              // The window for THIS bucket is empty. Rotate a tunnel: a new
+              // egress - a new exit IP - is a new quota bucket, and the SAME
+              // model serves again from it. The identity mint is the slow leg
+              // and runs alongside; it is only waited for if the fresh bucket
+              // does not help.
               //
               // The two legs have very different costs. The egress rotation
               // is SECONDS (the rotator replaces the registration and comes
@@ -2168,11 +2691,12 @@ function startServer(): void {
                 break outer
               }
               resets++
-              if (!egressRotated) {
-                egressRotated = true
+              const target = rotationTarget(drainedEgress, rotatedLegs)
+              if (target) {
+                rotatedLegs.add(target)
                 logActivity(
-                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window is empty - rotating the egress (seconds) and minting a new identity in the background (a minute)` +
-                    `${refillIn > 0 ? ` (the gateway says this window refills in ${refillIn}s)` : ""}`,
+                  `[${new Date().toISOString()}] SPIN 429 on ${wanted}: the window is empty - rotating the ${target} egress (seconds: a new account is a new exit IP is a new bucket) and minting a new identity in the background (a minute)` +
+                    `${refillIn > 0 ? ` (the gateway says THIS window refills in ${refillIn}s - that is this bucket; the other tunnels have their own windows)` : ""}`,
                 )
                 // Both legs are kicked, and NEITHER is waited for here. The
                 // rotation may still be in flight when the retry goes out
@@ -2181,11 +2705,11 @@ function startServer(): void {
                 // session fail while a fresh one worked: the reset ate the
                 // whole budget and the caller got the 503 before the fix it
                 // had asked for had landed.
-                egressPending = rotateEgress(`429-${wanted}`)
+                egressPending = rotateEgress(`429-${wanted}`, target)
                 egressPending.catch(() => {
                   /* performEgressRotation never rejects */
                 })
-                mintPending = mintIdentity(`429-${wanted}`)
+                mintPending = mintPending ?? mintIdentity(`429-${wanted}`)
                 mintPending.then(
                   (r) => {
                     mintSettled = true
@@ -2204,19 +2728,8 @@ function startServer(): void {
                 continue
               }
               // The egress had its chance (and the rotation may have landed
-              // by now). Wait for it, but never past the ceiling.
-              if (egressPending) {
-                const raced = await Promise.race([
-                  egressPending.then(() => ({ timedOut: false })),
-                  Bun.sleep(Math.max(0, remaining)).then(() => ({ timedOut: true })),
-                ])
-                if (raced.timedOut) {
-                  logActivity(
-                    `[${new Date().toISOString()}] SPIN ceiling reached while the egress was rotating - answering with a retryable 503`,
-                  )
-                  break outer
-                }
-              }
+              // by now) - that wait happens above, before a new rotation is
+              // started.
               // A fresh egress was not enough: now the identity is the
               // bottleneck. Wait for the mint (it is already running).
               logActivity(
@@ -2759,6 +3272,9 @@ export async function startRelay(): Promise<(() => Promise<void>) | undefined> {
       `[${new Date().toISOString()}] RELAY-LISTENING build=${BUILD} port=${PORT}`,
     )
     startWatchdog()
+    // Stop the relay when the instance that owns it goes away, so a closed
+    // window does not leave a server squatting on the port.
+    startParentGuard()
     // Bring the second leg up in the background: it is the device's own exit
     // IP, which is a second quota bucket. Fire and forget - the activation
     // budget is 5 s and the first request must not wait for it.

@@ -23,7 +23,9 @@ jobs:
           cp plugin/sajilo-relay.ts pkg/plugin/
           cp plugin/resources/* pkg/plugin/resources/
           cp install.sh install.ps1 install.cmd sajilo sajilo.cmd README.md pkg/
-          cp bin/warp-rotate.sh bin/tunnel-watchdog.sh pkg/bin/ 2>/dev/null || true
+          # The whole bin dir: the tunnel farm (tunnels.ps1), the rotator
+          # (usque-rotate.*), the doctor and the rebranding helpers.
+          cp bin/* pkg/bin/ 2>/dev/null || true
           tar -czf sajilo-bootstrap.tar.gz -C pkg .
           (cd pkg && zip -qr ../sajilo-bootstrap.zip .)
           ls -la sajilo-bootstrap.*
