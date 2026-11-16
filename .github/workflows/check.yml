@@ -20,11 +20,17 @@ jobs:
         # big file can silently move a function out of scope (the relay then
         # fails to load and the instance looks dead). This catches that class of
         # mistake before it ships.
+        #
+        # bunx installs typescript on first use and SAYS SO on stdout, and
+        # that noise lands in the file this step then asserts is empty - so
+        # the step failed on bun's install chatter instead of on a type
+        # error. The cache is warmed first, where the noise does not matter.
         run: |
+          bunx tsc --version >/dev/null 2>&1 || true
           bunx tsc --noEmit --skipLibCheck --target esnext --module esnext \
             --moduleResolution bundler --lib esnext,dom \
             plugin/sajilo-relay.ts bin/sajilo-relay.ts bin/sajilo-doctor.ts 2>&1 \
-            | grep -vE "TS2591|TS2868|TS2307|Cannot find name 'process'|Cannot find name 'Bun'|Cannot find type definition|Entry point of type library|If you have issues related to imports|The file is in the program because" \
+            | grep -vE "TS2591|TS2868|TS2307|Cannot find name 'process'|Cannot find name 'Bun'|Cannot find type definition|Entry point of type library|If you have issues related to imports|The file is in the program because|Resolving dependencies|Resolved, downloaded|Saved lockfile" \
             | tee /tmp/tsc.txt
           test ! -s /tmp/tsc.txt
 
