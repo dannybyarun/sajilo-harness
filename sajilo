@@ -31,6 +31,11 @@ HOME_DIR="$ROOT/home"
 STATE="$ROOT/state"
 WORK="$ROOT/work"
 TUNNEL_DIR="$ROOT/tunnel"
+# The instance's own bin: the installer puts the launcher, usque, the rotator,
+# the watchdog and the relay/doctor scripts here. The launcher must not guess
+# its own location - it is installed there AND symlinked onto PATH, so the
+# only stable path is the one derived from ROOT.
+BIN_DIR="$ROOT/bin"
 RELAY_PORT=${SAJILO_RELAY_PORT:-43915}
 TUNNEL_PORT=${SAJILO_TUNNEL_PORT:-40005}
 PLUGIN_DIR="$HOME_DIR/.config/opencode/plugin"
@@ -54,6 +59,13 @@ fi
 if [ -z "${OPENCODE_BIN:-}" ] && [ -f "$STATE/rebrand.txt" ]; then
   _rb=$(head -n 1 "$STATE/rebrand.txt" 2>/dev/null | tr -d '\r' || true)
   [ -n "$_rb" ] && [ -x "$_rb" ] && SAJILO_BIN="$_rb"
+fi
+# The instance's OWN copy of the runtime - the one the installer downloads
+# when the machine has no opencode at all. It is the last resort before the
+# bare "opencode" name: without it, an instance whose runtime lives in its
+# own bin and whose shell has no opencode on PATH has no runtime at all.
+if [ -z "${SAJILO_BIN:-}" ] && [ -z "${OPENCODE_BIN:-}" ] && [ -x "$BIN_DIR/opencode" ]; then
+  SAJILO_BIN="$BIN_DIR/opencode"
 fi
 OPENCODE_BIN=${SAJILO_BIN:-${OPENCODE_BIN:-opencode}}
 RESOURCES_DIR="$ROOT/resources"
@@ -121,7 +133,8 @@ else
   export OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false,"mini":{"splash":"hide"}}'
 fi
 export SAJILO_RELAY_ROTATOR="$ROOT/bin/warp-rotate.sh"
-export SAJILO_RELAY_WATCHDOG="$ROOT/bin/tunnel-watchdog.sh"export SAJILO_ROTATE_MARKER="$STATE/.rotate.inprogress"
+export SAJILO_RELAY_WATCHDOG="$ROOT/bin/tunnel-watchdog.sh"
+export SAJILO_ROTATE_MARKER="$STATE/.rotate.inprogress"
 
 tunnel_up() {
   curl -s -m 8 -x "http://127.0.0.1:$TUNNEL_PORT" \
@@ -140,6 +153,30 @@ warp_proxy_up() {
   (exec 3<>/dev/tcp/127.0.0.1/40000) >/dev/null 2>&1
 }
 
+# The pid of the process that is really serving our proxy port. $! is not
+# it: the shell forks a job that may be a wrapper (setsid) which has already
+# exited by the time anyone asks - so the pid file ends up holding a dead
+# pid, or worse, the launcher's own pid. procps is not everywhere, so /proc
+# is read directly - in the shell, without a process per line.
+usque_pid_for_port() {
+  local d pid part cmd
+  for d in /proc/[0-9]*; do
+    pid="${d#/proc/}"
+    [ -r "$d/cmdline" ] || continue
+    cmd=""
+    while IFS= read -r -d '' part; do
+      cmd="$cmd$part "
+    done <"$d/cmdline" 2>/dev/null
+    case "$cmd" in
+      *usque*http-proxy*"-p $TUNNEL_PORT"*)
+        printf '%s\n' "$pid"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 start_tunnel() {
   have_usque || return 1
   local usque; usque="$(usque_bin)"
@@ -148,9 +185,28 @@ start_tunnel() {
     (cd "$TUNNEL_DIR" && env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
       "$usque" register -a -c "$conf" -n "sajilo-$(date +%s)") >>"$STATE/register.log" 2>&1
   fi
-  (cd "$TUNNEL_DIR" && env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
-    setsid nohup "$usque" -c "$conf" http-proxy -b 127.0.0.1 -p "$TUNNEL_PORT" \
-    >>"$STATE/usque.log" 2>&1 & echo $! >"$STATE/usque.pid")
+  # Start the tunnel DETACHED. It has to outlive this script (the runtime is
+  # exec'd in a moment) and it must NOT be a child this shell waits for: a
+  # child left behind keeps the launcher alive - the shell sat in wait(2)
+  # for the tunnel instead of starting the runtime - and $! then points at
+  # the wrong process. So the job runs in a subshell of its own, in its own
+  # session (setsid), with stdin off the terminal.
+  (
+    cd "$TUNNEL_DIR" &&
+      env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
+        setsid nohup "$usque" -c "$conf" http-proxy -b 127.0.0.1 -p "$TUNNEL_PORT" \
+        </dev/null >>"$STATE/usque.log" 2>&1 &
+  )
+  # Record the pid that is really serving the port.
+  local pid=""
+  for _ in $(seq 1 30); do
+    pid="$(usque_pid_for_port || true)"
+    [ -n "$pid" ] && break
+    sleep 1
+  done
+  if [ -n "$pid" ]; then
+    printf '%s\n' "$pid" >"$STATE/usque.pid"
+  fi
   for _ in $(seq 1 30); do
     sleep 1
     tunnel_up && return 0
@@ -207,13 +263,10 @@ use_native() {
 use_relay() {
   mkdir -p "$HOME_DIR/.config/opencode" 2>/dev/null || true
   # The model the harness wants: one pin file, read live by BOTH sides.
-  # "sajilo model <name>" writes it, this puts it in the runtime config, and
-  # the relay honours the same file when a request carries no model - so
-  # changing the model in the harness changes what the relay sends upstream.
-  local model_json=""
-  if [ -n "$MODEL_ID" ]; then
-    model_json=",\"model\":\"$PROVIDER_PREFIX/$MODEL_ID\""
-  fi
+  # "sajilo model <name>" writes it, the relay honours the same file when a
+  # request carries no model - so changing the model in the harness changes
+  # what the relay sends upstream.
+  #
   # The provider and the model are NOT written into the config file - that
   # file belongs to the user (it is where "opencode mcp add", permissions,
   # agents and commands live). The relay plugin MERGES the sajilo provider

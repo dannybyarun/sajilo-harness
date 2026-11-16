@@ -132,6 +132,26 @@ usque_serves_port() {
   esac
 }
 
+# The pid of the usque that is REALLY serving our port. $! is the pid the
+# shell forked, and with setsid in the chain that is a wrapper which may
+# have exited already - so the pid file would point at a dead process and
+# the next rotation would not find the tunnel it is meant to replace.
+usque_pid_for_port() {
+  local d pid argline
+  for d in /proc/[0-9]*; do
+    pid="${d#/proc/}"
+    [ -r "$d/cmdline" ] || continue
+    argline=$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null) || continue
+    case "$argline" in
+      *usque*http-proxy*"-p $PORT "*)
+        printf '%s\n' "$pid"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 # procps is absent from the minimal base image: use the pid file plus /proc.
 stop_usque() {
   local d pid
@@ -166,14 +186,27 @@ start_usque() {
   # previous tunnel still held.
   setsid nohup env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
       -u ALL_PROXY -u all_proxy \
-      usque -c "$CONF" http-proxy -b 127.0.0.1 -p "$PORT" >>"$LOG" 2>&1 200<&- &
+      usque -c "$CONF" http-proxy -b 127.0.0.1 -p "$PORT" >>"$LOG" 2>&1 200<&- </dev/null &
   echo "$!" >"$STATE/usque.pid"
   local i
   for i in $(seq 1 90); do
-    probe && return 0
+    probe && break
     kill -0 "$(cat "$STATE/usque.pid" 2>/dev/null)" 2>/dev/null || return 1
     sleep 1
   done
+  # The job pid is not necessarily the usque pid (setsid may fork). Replace
+  # it with the pid that is really serving the port, so the next rotation
+  # finds the tunnel it is meant to replace.
+  local real_pid=""
+  for i in $(seq 1 10); do
+    real_pid="$(usque_pid_for_port || true)"
+    [ -n "$real_pid" ] && break
+    sleep 1
+  done
+  if [ -n "$real_pid" ]; then
+    echo "$real_pid" >"$STATE/usque.pid"
+  fi
+  probe && return 0
   return 1
 }
 
