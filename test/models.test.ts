@@ -1,0 +1,157 @@
+import { beforeAll, describe, expect, test } from "bun:test"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+// The relay is a side-effect-free module at import time (it only reads its
+// resources and defines functions), so the pure helpers can be tested directly.
+// Point it at the repo's plugin dir before the dynamic import resolves.
+type Relay = typeof import("../plugin/sajilo-relay")
+let relay: Relay
+
+beforeAll(async () => {
+  process.env.SAJILO_RELAY_DIR = join(import.meta.dir, "..", "plugin")
+  process.env.SAJILO_RELAY_ACTIVITY_LOG = join(tmpdir(), "sajilo-test-relay-activity.log")
+  relay = await import("../plugin/sajilo-relay")
+})
+
+const model = (context: number, output: number, name = "M", input?: number) => ({
+  name,
+  limit: { context, output, ...(input ? { input } : {}) },
+})
+
+describe("the built-in seed", () => {
+  test("every model is free, named, and carries a usable window", () => {
+    const models = relay.SAJILO_MODEL_LIST
+    expect(Object.keys(models).length).toBeGreaterThan(5)
+    for (const [id, m] of Object.entries(models)) {
+      expect(id.endsWith("-free")).toBe(true)
+      expect(m.name.length).toBeGreaterThan(0)
+      expect(Number.isInteger(m.limit.context)).toBe(true)
+      expect(m.limit.context).toBeGreaterThan(0)
+      expect(Number.isInteger(m.limit.output)).toBe(true)
+      expect(m.limit.output).toBeGreaterThan(0)
+      if (m.limit.input !== undefined) {
+        expect(Number.isInteger(m.limit.input)).toBe(true)
+        expect(m.limit.input).toBeLessThanOrEqual(m.limit.context)
+      }
+    }
+  })
+
+  test("a 1M model is not silently declared as 200k", () => {
+    expect(relay.SAJILO_MODEL_LIST["longcat-2.5-free"].limit.context).toBe(1_000_000)
+    expect(relay.SAJILO_MODEL_LIST["deepseek-v4.1-flash-free"].limit.context).toBe(200_000)
+  })
+})
+
+describe("modelsFromCatalogue", () => {
+  test("keeps free chat models and their limits, drops everything else", () => {
+    const out = relay.modelsFromCatalogue({
+      data: [
+        { id: "good-free", type: "chat", name: "Good", limit: { context: 1_000_000, output: 32_000 } },
+        {
+          id: "vision-free",
+          type: "chat",
+          name: "Vision",
+          limit: { context: 262_144, output: 65_536, input: 200_000 },
+        },
+        { id: "paid", type: "chat", name: "Paid", limit: { context: 1_000_000, output: 32_000 } },
+        { id: "image-free", type: "image", name: "Image", limit: { context: 1_000_000, output: 32_000 } },
+        { id: "broken-free", type: "chat", name: "Broken", limit: { context: 0, output: 32_000 } },
+        { id: "nolimit-free", type: "chat", name: "No limit" },
+        { id: "noname-free", type: "chat", limit: { context: 128_000, output: 16_000 } },
+      ],
+    })
+    expect(Object.keys(out).sort()).toEqual(["good-free", "noname-free", "vision-free"])
+    expect(out["good-free"]).toEqual(model(1_000_000, 32_000, "Good"))
+    expect(out["vision-free"].limit.input).toBe(200_000)
+    expect(out["noname-free"].name).toBe("noname-free")
+  })
+
+  test("junk payloads produce no models", () => {
+    for (const payload of [null, undefined, {}, { data: "nope" }, { data: [] }]) {
+      expect(relay.modelsFromCatalogue(payload)).toEqual({})
+    }
+  })
+})
+
+describe("mergeCatalogue", () => {
+  test("the live catalogue overrides the seed and new models are added", () => {
+    const seed = {
+      "a-free": model(200_000, 32_000, "Seed A"),
+      "b-free": model(200_000, 32_000, "Seed B"),
+    }
+    const live = {
+      "a-free": model(1_000_000, 64_000, "Live A"),
+      "c-free": model(262_144, 65_536, "Live C"),
+    }
+    expect(relay.mergeCatalogue(seed, live)).toEqual({
+      "a-free": model(1_000_000, 64_000, "Live A"),
+      "b-free": model(200_000, 32_000, "Seed B"),
+      "c-free": model(262_144, 65_536, "Live C"),
+    })
+  })
+})
+
+describe("mergeModelMaps", () => {
+  test("keeps user keys, keeps user models, and seeds missing ones", () => {
+    const seed = { "a-free": model(200_000, 32_000, "A") }
+    const existing = {
+      "a-free": {
+        limit: { context: 999_999, output: 12_345 },
+        variants: { high: { reasoningEffort: "high" } },
+      },
+      "mine-free": { name: "Mine", limit: { context: 1_000, output: 100 } },
+    }
+    const out = relay.mergeModelMaps(seed, existing)
+    expect(out["a-free"].limit).toEqual({ context: 999_999, output: 12_345 })
+    expect(out["a-free"].variants).toEqual({ high: { reasoningEffort: "high" } })
+    expect(out["mine-free"]).toEqual(existing["mine-free"])
+  })
+
+  test("an empty config still gets the whole seed", () => {
+    expect(relay.mergeModelMaps(relay.SAJILO_MODEL_LIST, {})).toEqual(relay.SAJILO_MODEL_LIST)
+  })
+})
+
+describe("parseModelsCache", () => {
+  test("accepts a good cache and drops unusable entries", () => {
+    const cache = relay.parseModelsCache(
+      JSON.stringify({
+        fetchedAt: 1_700_000_000_000,
+        models: {
+          "a-free": { name: "A", limit: { context: 1_000_000, output: 64_000 } },
+          "bad-free": { name: "Bad", limit: { context: "lots", output: 1 } },
+          "nofree": { name: "No limit" },
+        },
+      }),
+    )
+    expect(cache?.fetchedAt).toBe(1_700_000_000_000)
+    expect(Object.keys(cache!.models)).toEqual(["a-free"])
+  })
+
+  test("invalid JSON, missing fields and empty maps are no cache", () => {
+    for (const raw of ["", "not json", "{}", '{"fetchedAt":1,"models":{}}', '{"models":{"a-free":{}}}']) {
+      expect(relay.parseModelsCache(raw)).toBeNull()
+    }
+  })
+})
+
+describe("freeModelList", () => {
+  test("leads with the default model exactly once and publishes the real window", () => {
+    const models = {
+      "deepseek-v4.1-flash-free": model(200_000, 32_000, "DeepSeek"),
+      "beam-free": model(1_048_576, 131_072, "Beam"),
+    }
+    const list = relay.freeModelList(models)
+    expect(list.filter((m) => m.id === "deepseek-v4.1-flash-free")).toHaveLength(1)
+    expect(list[0].id).toBe("deepseek-v4.1-flash-free")
+    const beam = list.find((m) => m.id === "beam-free")!
+    expect(beam.context_length).toBe(1_048_576)
+    expect(beam.max_completion_tokens).toBe(131_072)
+    for (const entry of list) {
+      expect(entry.object).toBe("model")
+      expect(entry.owned_by).toBe("sajilo")
+      expect(entry.context_length).toBeGreaterThan(0)
+    }
+  })
+})

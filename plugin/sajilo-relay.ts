@@ -45,7 +45,15 @@
  * for upstream paths other than chat/completions.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs"
 import { connect } from "node:net"
 
 /**
@@ -59,8 +67,19 @@ function env(suffix: string, legacySuffix = suffix): string | undefined {
 
 const ACTIVITY_LOG =
   env("RELAY_ACTIVITY_LOG") ?? "/tmp/sajilo/relay-activity.log"
+// The log is diagnostics, not a ledger: cap it so a long-lived instance does
+// not grow a 60 MB file (which is what it did before this was added). One
+// generation is kept next to it as .1.
+const ACTIVITY_LOG_MAX_BYTES = Number(env("RELAY_LOG_MAX_BYTES") ?? 10 * 1024 * 1024)
 function logActivity(line: string): void {
   try {
+    try {
+      if (existsSync(ACTIVITY_LOG) && statSync(ACTIVITY_LOG).size > ACTIVITY_LOG_MAX_BYTES) {
+        renameSync(ACTIVITY_LOG, `${ACTIVITY_LOG}.1`)
+      }
+    } catch {
+      /* rotation is best-effort; never lose the line because of it */
+    }
     appendFileSync(ACTIVITY_LOG, line + "\n")
   } catch {
     try {
@@ -86,7 +105,7 @@ const PORT = Number(env("RELAY_PORT") ?? 43915)
 // A build marker. The doctor reads it to tell which relay wrote the log, and
 // judges only what THIS build did - the log also holds the history of
 // earlier builds, and an old rotation must not fail today's check.
-const BUILD = "reset-429-2026-11-13"
+const BUILD = "reset-429-2026-11-16-catalogue"
 // Where the relay listens. 127.0.0.1 keeps it on this machine (other local
 // agents can still use it). Set it to 0.0.0.0 to serve other machines - but
 // then a token is REQUIRED, because the relay spends the account's quota.
@@ -126,6 +145,121 @@ function upstreamBase(): string {
   }
   return env("RELAY_UPSTREAM") ?? "https://opencode.ai/inference/openai"
 }
+
+// ---- the live catalogue ----------------------------------------------------
+//
+// The gateway publishes every model it serves, with the real token window, at
+// GET <upstream>/v1/models (public - a bare curl gets it). Hand-maintaining a
+// copy of that list is how this harness shipped a missing model and a 200k
+// window for a 1M model. So the list is learned:
+//
+//   - the cache from the last run seeds the config at startup (no network wait)
+//   - a refresh runs in the background at start and every six hours
+//   - the SEED in this file is used only when neither exists
+//
+// A learned model is merged on top of the seed, so a release can still add a
+// model the gateway has not published yet, and a model that disappears from
+// the free tier is not silently dropped from an existing config.
+const MODELS_CACHE =
+  env("RELAY_MODELS_CACHE") ??
+  `${process.env.SAJILO_ROOT ?? `${process.env.HOME ?? ""}/..`}/state/models-cache.json`
+const CATALOGUE_TTL_MS = Number(env("RELAY_CATALOGUE_TTL_MS") ?? 30 * 24 * 3600_000)
+const CATALOGUE_REFRESH_MS = Number(env("RELAY_CATALOGUE_REFRESH_MS") ?? 6 * 3600_000)
+
+function catalogueUrl(): string {
+  const explicit = env("RELAY_CATALOGUE_URL")
+  if (explicit) return explicit
+  return `${upstreamBase()}/v1/models`
+}
+
+function readModelsCache(): ModelList | null {
+  try {
+    const cache = parseModelsCache(readFileSync(MODELS_CACHE, "utf8"))
+    if (!cache) return null
+    const age = Date.now() - cache.fetchedAt
+    if (age > CATALOGUE_TTL_MS) {
+      logActivity(
+        `CATALOGUE cache is ${Math.round(age / 3600_000)}h old - using the built-in seed until the refresh lands`,
+      )
+      return null
+    }
+    return mergeCatalogue(SAJILO_MODEL_LIST, cache.models)
+  } catch {
+    return null
+  }
+}
+
+let liveModels: ModelList | null = null
+let catalogueInFlight: Promise<boolean> | null = null
+let catalogueTimer: ReturnType<typeof setInterval> | null = null
+
+/** The seed for this process: the last learned catalogue, else the built-in table. */
+function currentModelList(): ModelList {
+  if (!liveModels) liveModels = readModelsCache() ?? SAJILO_MODEL_LIST
+  return liveModels
+}
+
+async function refreshCatalogue(port?: number): Promise<boolean> {
+  if (catalogueInFlight) return catalogueInFlight
+  catalogueInFlight = (async () => {
+    const url = catalogueUrl()
+    try {
+      const res = await fetch(url, {
+        headers: { accept: "application/json" },
+        signal: AbortSignal.timeout(Number(env("RELAY_CATALOGUE_TIMEOUT_MS") ?? 6_000)),
+      })
+      if (!res.ok) {
+        logActivity(
+          `CATALOGUE ${url} answered ${res.status} - keeping ${Object.keys(currentModelList()).length} known models`,
+        )
+        return false
+      }
+      const discovered = modelsFromCatalogue(await res.json())
+      if (!Object.keys(discovered).length) {
+        logActivity(`CATALOGUE ${url} listed no usable free models - keeping the seed`)
+        return false
+      }
+      const before = currentModelList()
+      const merged = mergeCatalogue(SAJILO_MODEL_LIST, discovered)
+      liveModels = merged
+      try {
+        mkdirSync(MODELS_CACHE.replace(/[\\/][^\\/]+$/, ""), { recursive: true })
+        writeFileSync(
+          MODELS_CACHE,
+          JSON.stringify({ fetchedAt: Date.now(), source: url, models: discovered }, null, 2),
+        )
+      } catch (e) {
+        logActivity(`CATALOGUE cache write failed: ${String(e).slice(0, 160)}`)
+      }
+      const added = Object.keys(discovered).filter((id) => !(id in before))
+      logActivity(
+        `CATALOGUE learned ${Object.keys(discovered).length} free models from ${url}${
+          added.length ? ` (new: ${added.join(", ")})` : ""
+        }`,
+      )
+      // The file the runtime reads changed, so re-merge it; the running
+      // runtime picks it up on its next config reload.
+      if (port && JSON.stringify(merged) !== JSON.stringify(before)) mergeRuntimeConfig(port)
+      return true
+    } catch (e) {
+      logActivity(
+        `CATALOGUE fetch failed (${String(e).slice(0, 160)}) - keeping ${Object.keys(currentModelList()).length} known models`,
+      )
+      return false
+    } finally {
+      catalogueInFlight = null
+    }
+  })()
+  return catalogueInFlight
+}
+
+function startCatalogueRefresh(port: number): void {
+  if (catalogueTimer) return
+  void refreshCatalogue(port)
+  catalogueTimer = setInterval(() => void refreshCatalogue(port), CATALOGUE_REFRESH_MS)
+  ;(catalogueTimer as unknown as { unref?: () => void }).unref?.()
+}
+
 const HOP_KEYS = "host|connection|content-length|transfer-encoding|accept-encoding|keep-alive|upgrade|te|trailers"
 const INJECT_KEYS = "user-agent|x-opencode-client|x-opencode-session|x-opencode-session-id|x-session-affinity|x-session-id|x-opencode-project|b3|traceparent|authorization"
 // Header fingerprint tightened (Nov 10 2026): the live CLI sends NO b3/
@@ -147,15 +281,21 @@ const AGENT_TOOLS = JSON.parse(
 
 // The free pool, as the runtime's own provider presents it.
 //
-// The limits are the gateway's own published numbers (GET
-// /inference/openai/v1/models, cross-checked against models.dev), not guesses:
-// a model declared without them is silently treated as 200k context / 32k
-// output by the runtime, which compacts a 1M-token model six times too early.
-// Three free variants really are 200k; the rest are not.
-const SAJILO_MODEL_LIST: Record<
-  string,
-  { name: string; limit: { context: number; output: number; input?: number } }
-> = {
+// This table is the OFFLINE SEED, not the truth: the gateway publishes the
+// live catalogue (with each model's real `limit`) at GET
+// /inference/openai/v1/models, and the relay learns it at startup, caches it
+// under state/models-cache.json, and refreshes it every six hours. The seed
+// only has to be good enough to start when the gateway is unreachable, so a
+// free model that lands between releases still appears without a patch.
+//
+// The limits here are the gateway's own published numbers, cross-checked
+// against models.dev: a model declared without them is silently treated as
+// 200k context / 32k output by the runtime, which compacts a 1M-token model
+// six times too early. Three free variants really are 200k; the rest are not.
+type ModelSpec = { name: string; limit: { context: number; output: number; input?: number } }
+type ModelList = Record<string, ModelSpec>
+
+export const SAJILO_MODEL_LIST: ModelList = {
   "deepseek-v4.1-flash-free": {
     name: "DeepSeek V4.1 Flash Free",
     limit: { context: 200_000, output: 32_000 },
@@ -205,6 +345,94 @@ const SAJILO_MODEL_LIST: Record<
     limit: { context: 1_048_576, input: 983_040, output: 65_536 },
   },
 }
+
+/**
+ * Pick the free, chat-capable models out of a gateway catalogue response.
+ * Anything without a usable context/output pair is dropped: a model that
+ * cannot tell us its window is worse than a model we know, because the
+ * runtime would invent 200k for it.
+ */
+export function modelsFromCatalogue(payload: unknown): ModelList {
+  const data = (payload as { data?: unknown } | null)?.data
+  if (!Array.isArray(data)) return {}
+  const out: ModelList = {}
+  for (const raw of data) {
+    if (!raw || typeof raw !== "object") continue
+    const m = raw as Record<string, unknown>
+    const id = typeof m.id === "string" ? m.id : ""
+    const type = typeof m.type === "string" ? m.type : "chat"
+    if (!id.endsWith("-free") || type !== "chat") continue
+    const limit = m.limit as Record<string, unknown> | undefined
+    const context = Number(limit?.context)
+    const output = Number(limit?.output)
+    if (!Number.isFinite(context) || !Number.isFinite(output) || context <= 0 || output <= 0) continue
+    const input = Number(limit?.input)
+    out[id] = {
+      name: typeof m.name === "string" && m.name ? m.name : id,
+      limit: {
+        context,
+        output,
+        ...(Number.isFinite(input) && input > 0 ? { input } : {}),
+      },
+    }
+  }
+  return out
+}
+
+/** Seed first, live catalogue on top: a learned model wins, a missing one stays. */
+export function mergeCatalogue(seed: ModelList, discovered: ModelList): ModelList {
+  return { ...seed, ...discovered }
+}
+
+/**
+ * Merge the model map of the provider into the user's config instead of
+ * replacing it. Replacing it wiped every per-model key the user had put there,
+ * and a model with no `limit` is read as 200k/32k no matter what it really
+ * holds. Our entry is the seed; anything the config already says wins, and
+ * models the user added by hand are kept.
+ */
+export function mergeModelMaps(
+  seed: ModelList,
+  existing: Record<string, Record<string, unknown>>,
+): Record<string, Record<string, unknown>> {
+  const models: Record<string, Record<string, unknown>> = {}
+  for (const [id, spec] of Object.entries(seed)) {
+    const prev = existing[id]
+    models[id] = { ...spec, ...(typeof prev === "object" && prev ? prev : {}) }
+  }
+  for (const [id, spec] of Object.entries(existing)) {
+    if (!(id in models)) models[id] = spec
+  }
+  return models
+}
+
+/** Validate the on-disk catalogue cache; junk is the same as no cache. */
+export function parseModelsCache(raw: string): { fetchedAt: number; models: ModelList } | null {
+  try {
+    const j = JSON.parse(raw) as Record<string, unknown>
+    const fetchedAt = Number(j?.fetchedAt)
+    const models = j?.models
+    if (!Number.isFinite(fetchedAt) || !models || typeof models !== "object") return null
+    const clean: ModelList = {}
+    for (const [id, value] of Object.entries(models as Record<string, unknown>)) {
+      if (!value || typeof value !== "object") continue
+      const v = value as Record<string, unknown>
+      const limit = v.limit as Record<string, unknown> | undefined
+      const context = Number(limit?.context)
+      const output = Number(limit?.output)
+      if (!Number.isFinite(context) || !Number.isFinite(output) || context <= 0 || output <= 0) continue
+      const input = Number(limit?.input)
+      clean[id] = {
+        name: typeof v.name === "string" && v.name ? v.name : id,
+        limit: { context, output, ...(Number.isFinite(input) && input > 0 ? { input } : {}) },
+      }
+    }
+    return Object.keys(clean).length ? { fetchedAt, models: clean } : null
+  } catch {
+    return null
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // The live harness.
@@ -544,39 +772,21 @@ const callerStreamWants = new WeakMap<Request, boolean>()
 //
 // The free pool is not hand-picked: the gateway publishes the whole
 // catalogue at GET /inference/openai/v1/models (which is NOT behind the
-// whitelist - a bare curl gets it), and it lists twelve free models.
-// Eleven of them are text-capable chat models; nemotron-3.5-super-vl-free is
-// vision-first, so it stays last. minimax-m3.1-flash-free was missing from
-// the original hand-written list even though it is one of the free models,
-// and hy4-flash-free landed on 2026-11-16.
+// whitelist - a bare curl gets it), and the relay learns it (see the live
+// catalogue section above). The built-in seed exists for the offline case.
 // The model Sajilo leads with. The harness asks for it by default, and the
 // relay falls back to it when a request carries no model at all.
 const DEFAULT_MODEL = "deepseek-v4.1-flash-free"
-
-const FREE_POOL_FALLBACK = [
-  DEFAULT_MODEL,
-  "mimo-v2.6-flash-free",
-  "glm-5.3-flash-free",
-  "longcat-2.5-free",
-  "iceman-free",
-  "inkling-2-small-free",
-  "beam-free",
-  "flint-40b-free",
-  "nemotron-3.5-lightning-free",
-  "minimax-m3.1-flash-free",
-  "hy4-flash-free",
-  "nemotron-3.5-super-vl-free",
-]
 
 /**
  * The catalogue served to clients. Only the free pool: the gateway lists 85
  * models but the paid ones cannot be used with the free quota, and a client
  * that picks one just gets a 429.
  */
-function freeModelList(): Array<Record<string, unknown>> {
-  const ids = [DEFAULT_MODEL, ...FREE_POOL_FALLBACK].filter((m, i, a) => a.indexOf(m) === i)
+export function freeModelList(models: ModelList = currentModelList()): Array<Record<string, unknown>> {
+  const ids = [DEFAULT_MODEL, ...Object.keys(models)].filter((m, i, a) => a.indexOf(m) === i)
   return ids.map((id) => {
-    const limit = SAJILO_MODEL_LIST[id]?.limit
+    const limit = models[id]?.limit
     return {
       id,
       object: "model",
@@ -3105,24 +3315,15 @@ function mergeRuntimeConfig(port: number): void {
     typeof cfg.provider === "object" && cfg.provider
       ? (cfg.provider as Record<string, unknown>)
       : {}
-  // Merge the model map instead of replacing it. Replacing it wiped every
-  // per-model key the user (or an older release) had put there, and a model
-  // with no `limit` is read as 200k/32k no matter what the model really holds.
-  // Our entry is the seed; anything the config already says wins, and models
-  // the user added by hand are kept.
+  // Merge the model map instead of replacing it (see mergeModelMaps): the seed
+  // is the learned catalogue, anything the config already says wins, and
+  // models the user added by hand are kept.
   const current = allProviders[providerId]
   const currentModels =
     typeof current === "object" && current && typeof (current as Record<string, unknown>).models === "object"
       ? ((current as Record<string, unknown>).models as Record<string, Record<string, unknown>>)
       : {}
-  const models: Record<string, Record<string, unknown>> = {}
-  for (const [id, spec] of Object.entries(SAJILO_MODEL_LIST)) {
-    const prev = currentModels[id]
-    models[id] = { ...spec, ...(typeof prev === "object" && prev ? prev : {}) }
-  }
-  for (const [id, spec] of Object.entries(currentModels)) {
-    if (!(id in models)) models[id] = spec
-  }
+  const models = mergeModelMaps(currentModelList(), currentModels)
   const provider: Record<string, unknown> = {
     ...allProviders,
     [providerId]: {
@@ -3305,6 +3506,9 @@ export async function startRelay(): Promise<(() => Promise<void>) | undefined> {
 
     // Point the runtime at this relay, keeping the user's config intact.
     mergeRuntimeConfig(PORT)
+    // Learn the gateway's live catalogue in the background: new free models
+    // and their real token windows, without waiting for a release.
+    startCatalogueRefresh(PORT)
 
     try {
       startServer()
@@ -3372,6 +3576,10 @@ export async function startRelay(): Promise<(() => Promise<void>) | undefined> {
         /* ignore */
       }
       server = null
+      if (catalogueTimer) {
+        clearInterval(catalogueTimer)
+        catalogueTimer = null
+      }
       if (takeoverTimer) {
         clearInterval(takeoverTimer)
         takeoverTimer = null

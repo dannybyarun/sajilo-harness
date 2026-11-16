@@ -702,6 +702,12 @@ anything the file already says for that model wins, and models you add by hand
 are kept. A model with no `limit` is read as 200k/32k by the runtime, so a
 1M-token model would compact six times too early.
 
+The list is not hand-maintained either: at startup the relay learns the
+gateway's live catalogue (models **and** their real token windows), keeps the
+last good copy in `state/models-cache.json`, and refreshes it every six hours.
+The table inside the plugin is only the offline seed. CI still diffs that seed
+against the live catalogue, so a release cannot ship a stale one.
+
 One trap worth knowing: **a UTF-8 BOM in the config file makes opencode ignore
 the whole file.** PowerShell's `Set-Content -Encoding utf8` writes one, and so
 do some Windows editors. If your MCP servers mysteriously disappear, check the
@@ -718,7 +724,8 @@ Everything the relay decides, in `<root>/state/`:
 
 | file | what it holds |
 |---|---|
-| `relay-activity.log` | every decision: the model each request chose, every upstream status, every 429 and when it refills, every ladder move, every reset, every harness capture, every config merge |
+| `relay-activity.log` | every decision: the model each request chose, every upstream status, every 429 and when it refills, every ladder move, every reset, every harness capture, every config merge. Rotates to `relay-activity.log.1` at 10 MB |
+| `models-cache.json` | the free-model catalogue last learned from the gateway, with each model's real `limit` |
 | `relay-last-incoming.json` | the last request body exactly as the client sent it |
 | `relay-last-transformed.json` | the same body after the relay rewrote it into the agent class |
 | `relay-last-meta.txt` | pathname, model, and the size of both |
@@ -835,6 +842,11 @@ file.
 | `SAJILO_RELAY_AUTOMINT=0` | disable the automatic identity rotation |
 | `SAJILO_RELAY_EGRESS_ROTATE=0` | the reset refreshes the credential but does not touch the egress |
 | `SAJILO_SKIP_TUNNEL=1` | the installer does not install the rotatable WARP tunnel (the relay resets the identity instead) |
+| `SAJILO_RELAY_CATALOGUE_URL` | where the free-model catalogue is learned from (default `<upstream>/v1/models`) |
+| `SAJILO_RELAY_CATALOGUE_TTL_MS` | how old the cached catalogue may be before the built-in seed is used instead (default 30 days) |
+| `SAJILO_RELAY_CATALOGUE_REFRESH_MS` | how often the catalogue is refreshed in the background (default 6 h) |
+| `SAJILO_RELAY_MODELS_CACHE` | where the learned catalogue is cached (default `<root>/state/models-cache.json`) |
+| `SAJILO_RELAY_LOG_MAX_BYTES` | rotate the activity log at this size (default 10485760 = 10 MB; one `.1` generation is kept) |
 | `OPENCODE_BIN` | legacy alias for `SAJILO_BIN` |
 
 The `OPENCODE_RELAY_*` names still work everywhere a `SAJILO_RELAY_*` name is

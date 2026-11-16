@@ -34,5 +34,15 @@ jobs:
           bash -n install.sh
           bash -n bin/sajilo-rebrand.sh
 
+      - name: unit tests
+        run: bun test
+
+      - name: catalogue drift
+        # The relay learns the live free-model catalogue at runtime, but the
+        # offline seed must stay in step: a new free model, a removed one, or a
+        # changed token window fails here instead of shipping as a 200k window
+        # on a 1M model. An unreachable gateway is not drift (exit 0).
+        run: bun tools/check-catalogue.ts
+
       - name: build the relay
         run: bun build --target=bun --external "@opencode/plugin" --external "node:*" plugin/sajilo-relay.ts --outdir /tmp/build
