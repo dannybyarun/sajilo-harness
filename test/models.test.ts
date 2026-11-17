@@ -134,6 +134,30 @@ describe("mergeModelMaps", () => {
     expect(out["minimax-m3.1-flash-free"]).toBeUndefined()
     expect(out["deepseek-v4.1-flash-free"]).toBeDefined()
   })
+
+  // The real caller hands in `cfg.provider.sajilo.models` - a reference INTO
+  // the config it just parsed - and then writes the config only if
+  // JSON.stringify(cfg) changed. Dropping the retired entry from that object
+  // made `before` lose it too, so the comparison said "nothing changed" and
+  // the file kept the dead model. The merge must not touch its input.
+  test("dropping a retired model does not mutate the caller's config", () => {
+    const cfg = {
+      provider: {
+        sajilo: {
+          models: {
+            "minimax-m3.1-flash-free": {
+              name: "MiniMax M3.1 Flash",
+              limit: { context: 1_000_000, output: 512_000 },
+            },
+          },
+        },
+      },
+    }
+    const before = JSON.stringify(cfg)
+    const out = relay.mergeModelMaps(relay.SAJILO_MODEL_LIST, cfg.provider.sajilo.models)
+    expect(out["minimax-m3.1-flash-free"]).toBeUndefined()
+    expect(JSON.stringify(cfg)).toBe(before)
+  })
 })
 
 describe("parseModelsCache", () => {

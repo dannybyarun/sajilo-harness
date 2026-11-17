@@ -109,7 +109,7 @@ const PORT = Number(env("RELAY_PORT") ?? 43915)
 // A build marker. The doctor reads it to tell which relay wrote the log, and
 // judges only what THIS build did - the log also holds the history of
 // earlier builds, and an old rotation must not fail today's check.
-const BUILD = "json-mode-2026-11-18.4"
+const BUILD = "json-mode-2026-11-18.5"
 // Where the relay listens. 127.0.0.1 keeps it on this machine (other local
 // agents can still use it). Set it to 0.0.0.0 to serve other machines - but
 // then a token is REQUIRED, because the relay spends the account's quota.
@@ -412,15 +412,23 @@ export function mergeModelMaps(
   existing: Record<string, Record<string, unknown>>,
 ): Record<string, Record<string, unknown>> {
   // A retired model is not "an existing key worth keeping" - it is a dead
-  // entry that the picker would still offer. Drop it before merging.
-  for (const id of RETIRED_MODELS) delete existing[id]
+  // entry that the picker would still offer.
+  //
+  // It is skipped on both sides, never deleted from `existing`: that object is
+  // the caller's config (mergeRuntimeConfig hands in cfg.provider.x.models),
+  // and it decides whether to write by comparing the config before and after
+  // this call. Deleting here changed `before` as well, so the comparison said
+  // "nothing changed" and the retired entry stayed on disk forever - the picker
+  // kept offering it while /v1/models no longer did.
+  const retired = new Set(RETIRED_MODELS)
   const models: Record<string, Record<string, unknown>> = {}
   for (const [id, spec] of Object.entries(seed)) {
+    if (retired.has(id)) continue
     const prev = existing[id]
     models[id] = { ...spec, ...(typeof prev === "object" && prev ? prev : {}) }
   }
   for (const [id, spec] of Object.entries(existing)) {
-    if (!(id in models)) models[id] = spec
+    if (!retired.has(id) && !(id in models)) models[id] = spec
   }
   return models
 }
@@ -2395,6 +2403,13 @@ function startTakeover(): void {
       process.stderr.write(
         `[sajilo-relay] took over port ${PORT} (the previous owner went away)\n`,
       )
+      // This instance is the one serving now, so it is the one that must point
+      // the runtime at the relay and keep the catalogue current. The bind path
+      // does both before startServer(); the takeover path used to do neither,
+      // so a reload that ended up here served the new build while the config
+      // still described the old one.
+      mergeRuntimeConfig(PORT)
+      startCatalogueRefresh(PORT)
       // The instance that takes over is the one that must keep watching the
       // tunnel from now on.
       startWatchdog()
