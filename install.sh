@@ -125,6 +125,20 @@ say() { printf 'install: %s\n' "$*"; }
 say_err() { printf 'install: %s\n' "$*" >&2; }
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 
+# This is the Linux/macOS installer; Windows has its own (install.cmd ->
+# install.ps1) and its own launcher (sajilo.cmd). Running THIS one from Git
+# Bash would not fail loudly - $HOME is C:\Users\<you>, so ROOT resolves to the
+# SAME ~/.sajilo the cmd launcher uses. It would copy the unix helpers over the
+# instance's bin, link a launcher into ~/.local/bin and append a PATH line to
+# ~/.bashrc and ~/.profile that nothing on Windows reads. Refuse instead, and
+# leave --status alone: that one only reads.
+case "$(uname -s 2>/dev/null)" in
+  MINGW* | MSYS* | CYGWIN*)
+    [ "$MODE" = "status" ] ||
+      die "this is the Linux/macOS installer - on Windows run install.cmd instead (it installs the same instance under %USERPROFILE%\\.sajilo)"
+    ;;
+esac
+
 # ------------------------------------------------------------------ status
 status_report() {
   printf 'root        : %s\n' "$ROOT"
