@@ -272,3 +272,29 @@ describe("unwrapJson", () => {
     expect(relay.unwrapJson("")).toBe("")
   })
 })
+
+// Cloudflare's trace answer is what the reserve probe reads: it is the only
+// check that proves a tunnel leaves AND leaves through WARP without spending
+// model quota. Parsing it is pure, so it is tested here rather than behind a
+// network call.
+describe("parseWarpTrace", () => {
+  const trace = (ip: string, warp: string) =>
+    ["fl=1f2", "h=www.cloudflare.com", `ip=${ip}`, "ts=1", "warp=" + warp, "gateway=off"].join("\n")
+
+  test("reads the exit address and the warp flag", () => {
+    expect(relay.parseWarpTrace(trace("2a09:bac5:4e7f:16aa::242:9c", "on"))).toEqual({
+      ip: "2a09:bac5:4e7f:16aa::242:9c",
+      warp: true,
+    })
+  })
+
+  test("warp=off is reported as off - the machine's own address is not a bucket", () => {
+    expect(relay.parseWarpTrace(trace("27.34.64.23", "off"))).toEqual({ ip: "27.34.64.23", warp: false })
+  })
+
+  test("a trace without an ip is not a verdict, it is noise", () => {
+    expect(relay.parseWarpTrace("h=www.cloudflare.com\nwarp=on")).toBeNull()
+    expect(relay.parseWarpTrace("ip=1.2.3.4")).toBeNull()
+    expect(relay.parseWarpTrace("")).toBeNull()
+  })
+})

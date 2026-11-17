@@ -109,7 +109,7 @@ const PORT = Number(env("RELAY_PORT") ?? 43915)
 // A build marker. The doctor reads it to tell which relay wrote the log, and
 // judges only what THIS build did - the log also holds the history of
 // earlier builds, and an old rotation must not fail today's check.
-const BUILD = "json-mode-2026-11-18.5"
+const BUILD = "json-mode-2026-11-18.6"
 // Where the relay listens. 127.0.0.1 keeps it on this machine (other local
 // agents can still use it). Set it to 0.0.0.0 to serve other machines - but
 // then a token is REQUIRED, because the relay spends the account's quota.
@@ -1332,6 +1332,11 @@ function rotateLeg(leg: Egress, reason: string): Promise<boolean> {
         logActivity(
           `[${new Date().toISOString()}] RESERVE the ${leg} bucket: it is the freshest one now, and it is back in reserve`,
         )
+        // ...and CHECK it. A rotation can report success and still leave a leg
+        // that cannot egress (usque registered but not connected), which would
+        // give a spare that reads right in the log and fails the moment it is
+        // used. Background: the rotation chain is not held for a probe.
+        void checkReserve(3)
       }
     }
     return ok
@@ -1788,6 +1793,107 @@ async function fetchUpstream(
     else process.env.NO_PROXY = savedNO
     if (savedno === undefined) delete process.env.no_proxy
     else process.env.no_proxy = savedno
+  }
+}
+
+/**
+ * Does a leg actually LEAVE, and does it leave through WARP?
+ *
+ * Cloudflare's trace endpoint answers with the caller's address and whether
+ * the request arrived over WARP. It is one small GET and no model tokens,
+ * which is the point: probing the RESERVE must not spend the very bucket that
+ * makes it a reserve. A chat request through a leg would answer 429 for a
+ * throttled ACCOUNT and say nothing about the tunnel.
+ */
+export function parseWarpTrace(text: string): { ip: string; warp: boolean } | null {
+  const ip = /^ip=(.+)$/m.exec(text)?.[1]?.trim()
+  const warp = /^warp=(\w+)$/m.exec(text)?.[1]?.trim()
+  if (!ip || !warp) return null
+  return { ip, warp: warp === "on" }
+}
+
+export type LegProbe = { ok: boolean; ip?: string; warp?: boolean; error?: string }
+
+/**
+ * Probe ONE leg. ok means "this leg can serve as a fresh bucket": it answered,
+ * and it answered from WARP. warp=off is NOT ok - that is the machine's own
+ * address, the leg is not doing its job, and the direct leg already covers
+ * that path.
+ */
+async function probeLeg(egress: Egress, timeoutMs = 8_000): Promise<LegProbe> {
+  try {
+    const resp = await fetchUpstream(
+      "https://www.cloudflare.com/cdn-cgi/trace",
+      { signal: AbortSignal.timeout(timeoutMs), headers: { accept: "text/plain" } },
+      egress,
+    )
+    if (!resp.ok) {
+      try {
+        await resp.body?.cancel()
+      } catch {
+        /* ignore */
+      }
+      return { ok: false, error: `HTTP ${resp.status}` }
+    }
+    const seen = parseWarpTrace(await resp.text())
+    if (!seen) return { ok: false, error: "no ip/warp in the trace answer" }
+    if (!seen.warp) return { ok: false, ip: seen.ip, warp: false, error: "warp=off" }
+    return { ok: true, ip: seen.ip, warp: true }
+  } catch (e) {
+    return { ok: false, error: String(e).slice(0, 160) }
+  }
+}
+
+// The last look at the spare, with its age. /relay-health serves it, so "is
+// the backup leg alive" has a visible answer instead of being a guess made at
+// the moment it is needed.
+let reserveProbe: (LegProbe & { at: number; leg: Egress; proxy: string | null }) | null = null
+let reserveProbeBusy = false
+
+/**
+ * Probe the leg that is currently held back, and write a line only when the
+ * answer CHANGES - plus one on the first success after a start, which is the
+ * line that proves the spare works on this machine before it is needed.
+ */
+async function checkReserve(attempts = 1): Promise<void> {
+  if (reserveProbeBusy) return
+  const leg = currentReserve()
+  if (!leg) return
+  reserveProbeBusy = true
+  try {
+    let seen = await probeLeg(leg)
+    // A leg that was just rotated comes back before its tunnel is ready, so a
+    // single probe can read warp=off while usque is still connecting. Give it
+    // a couple of chances before calling the spare broken.
+    for (let i = 1; i < attempts && !seen.ok; i++) {
+      await Bun.sleep(1_500)
+      seen = await probeLeg(leg)
+    }
+    const proxy = proxyForLeg(leg)
+    const before = reserveProbe?.ok
+    reserveProbe = { ...seen, at: Date.now(), leg, proxy }
+    const where = `${leg}${proxy ? ` (${proxy})` : ""}`
+    if (!seen.ok) {
+      // The spare is the one leg nobody rides, so a broken spare is otherwise
+      // found on the day it is wanted. One line per change, not per tick.
+      if (before !== false) {
+        logActivity(
+          `[${new Date().toISOString()}] RESERVE probe ${where} FAILED (${seen.error}) - the backup leg cannot serve, and the next drain has no spare`,
+        )
+      }
+      return
+    }
+    if (before === undefined) {
+      logActivity(
+        `[${new Date().toISOString()}] RESERVE verified ${where} exits ${seen.ip} warp=on - the backup leg works before it is needed`,
+      )
+    } else if (before === false) {
+      logActivity(
+        `[${new Date().toISOString()}] RESERVE probe ${where} ok again: exits ${seen.ip} warp=on`,
+      )
+    }
+  } finally {
+    reserveProbeBusy = false
   }
 }
 
@@ -2497,6 +2603,20 @@ function startServer(): void {
             // drained.
             reserve: currentReserve(),
             reserveServing,
+            // The last in-process probe of that spare: a trace request through
+            // the reserve leg (no model quota spent). ageSeconds tells you how
+            // stale the answer is - a fresh relay re-probes every 3 minutes.
+            reserveProbe: reserveProbe
+              ? {
+                  leg: reserveProbe.leg,
+                  proxy: reserveProbe.proxy,
+                  ok: reserveProbe.ok,
+                  ip: reserveProbe.ip ?? null,
+                  warp: reserveProbe.warp ?? null,
+                  error: reserveProbe.error ?? null,
+                  ageSeconds: Math.round((Date.now() - reserveProbe.at) / 1000),
+                }
+              : null,
             proxy: env("RELAY_PROXY") ?? null,
             proxyAlt: env("RELAY_PROXY_ALT") ?? null,
             proxyAlts: (env("RELAY_PROXY_ALTS") ?? "")
@@ -3653,11 +3773,11 @@ function startWatchdog(): void {
     ? (env("RELAY_WATCHDOG") ??
       `${process.env.LOCALAPPDATA ?? ""}\\opencode-warp\\bin\\probe.cmd`)
     : (env("RELAY_WATCHDOG") ?? "/usr/local/lib/opencode-warp/tunnel-watchdog.sh")
-  if (!existsSync(WATCHDOG)) {
+  const probePresent = existsSync(WATCHDOG)
+  if (!probePresent) {
     logActivity(
-      `[${new Date().toISOString()}] WATCHDOG not present (${WATCHDOG}) - the egress is not being watched`,
+      `[${new Date().toISOString()}] WATCHDOG not present (${WATCHDOG}) - the egress is not being watched (the reserve is still probed in-process)`,
     )
-    return
   }
   let watchdogBusy = false
   // probe.ps1 takes its target from the ENVIRONMENT, not from argv: PROXY and
@@ -3670,6 +3790,11 @@ function startWatchdog(): void {
   const probeProxy = isWindows ? (env("RELAY_PROXY") ?? "") : ""
   const probePort = /:(\d+)\/?$/.exec(probeProxy)?.[1] ?? ""
   const watchdogTick = () => {
+    // The spare is checked in-process on every tick, with a trace request that
+    // spends no model quota - so "the backup works" is re-established every
+    // three minutes instead of assumed until the day it is needed.
+    void checkReserve()
+    if (!probePresent) return
     if (watchdogBusy) return
     watchdogBusy = true
     try {
@@ -3720,6 +3845,10 @@ function startWatchdog(): void {
   watchdogTimer = setInterval(watchdogTick, 3 * 60_000)
   watchdogSlot[WATCHDOG_SLOT] = watchdogTimer
   unrefTimer(watchdogTimer)
+  // ...and look at the spare once, now, so /relay-health has an answer in
+  // seconds instead of after the first grace period. Two attempts: a tunnel
+  // that is still connecting reads warp=off on the first one.
+  void checkReserve(2)
 }
 
 /**
