@@ -90,6 +90,13 @@ describe("mergeCatalogue", () => {
       "c-free": model(262_144, 65_536, "Live C"),
     })
   })
+
+  // The cache is written while a model is alive, so it can still list a model
+  // the gateway has since retired. It must not come back through that path.
+  test("a retired model is not resurrected by an old cache entry", () => {
+    const cache = { "minimax-m3.1-flash-free": model(1_000_000, 512_000, "MiniMax") }
+    expect(relay.mergeCatalogue({}, cache)["minimax-m3.1-flash-free"]).toBeUndefined()
+  })
 })
 
 describe("mergeModelMaps", () => {
@@ -110,6 +117,22 @@ describe("mergeModelMaps", () => {
 
   test("an empty config still gets the whole seed", () => {
     expect(relay.mergeModelMaps(relay.SAJILO_MODEL_LIST, {})).toEqual(relay.SAJILO_MODEL_LIST)
+  })
+
+  // The gateway removed minimax-m3.1-flash-free on 2026-11-17 and answers 410
+  // Gone for it. An older config still carries it, and "keep the user's keys"
+  // must not turn that into "keep offering a model that no longer answers".
+  test("a model the gateway retired is dropped, not kept as an existing key", () => {
+    const existing = {
+      "minimax-m3.1-flash-free": {
+        name: "MiniMax M3.1 Flash",
+        limit: { context: 1_000_000, output: 512_000 },
+        variants: { high: { reasoningEffort: "high" } },
+      },
+    }
+    const out = relay.mergeModelMaps(relay.SAJILO_MODEL_LIST, existing)
+    expect(out["minimax-m3.1-flash-free"]).toBeUndefined()
+    expect(out["deepseek-v4.1-flash-free"]).toBeDefined()
   })
 })
 

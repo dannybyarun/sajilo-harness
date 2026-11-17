@@ -109,7 +109,7 @@ const PORT = Number(env("RELAY_PORT") ?? 43915)
 // A build marker. The doctor reads it to tell which relay wrote the log, and
 // judges only what THIS build did - the log also holds the history of
 // earlier builds, and an old rotation must not fail today's check.
-const BUILD = "json-mode-2026-11-18.3"
+const BUILD = "json-mode-2026-11-18.4"
 // Where the relay listens. 127.0.0.1 keeps it on this machine (other local
 // agents can still use it). Set it to 0.0.0.0 to serve other machines - but
 // then a token is REQUIRED, because the relay spends the account's quota.
@@ -379,9 +379,25 @@ export function modelsFromCatalogue(payload: unknown): ModelList {
   return out
 }
 
+/**
+ * Models this harness once advertised and the gateway has since REMOVED.
+ *
+ * A removed model must not linger in the runtime config: that map is merged,
+ * never replaced, so an entry written by an older release stays in the picker
+ * forever. The request leaves, the gateway answers 410 Gone, and the harness
+ * looks broken for a reason that is not on this machine. minimax went that way
+ * on 2026-11-17; `bun tools/check-catalogue.ts` is what notices the next seed
+ * model to go, and it is where this list grows.
+ */
+const RETIRED_MODELS = ["minimax-m3.1-flash-free"]
+
 /** Seed first, live catalogue on top: a learned model wins, a missing one stays. */
 export function mergeCatalogue(seed: ModelList, discovered: ModelList): ModelList {
-  return { ...seed, ...discovered }
+  const merged = { ...seed, ...discovered }
+  // The cache is written while a model is alive, so a retired one can still be
+  // sitting in it. It must not come back through the cache either.
+  for (const id of RETIRED_MODELS) delete merged[id]
+  return merged
 }
 
 /**
@@ -395,6 +411,9 @@ export function mergeModelMaps(
   seed: ModelList,
   existing: Record<string, Record<string, unknown>>,
 ): Record<string, Record<string, unknown>> {
+  // A retired model is not "an existing key worth keeping" - it is a dead
+  // entry that the picker would still offer. Drop it before merging.
+  for (const id of RETIRED_MODELS) delete existing[id]
   const models: Record<string, Record<string, unknown>> = {}
   for (const [id, spec] of Object.entries(seed)) {
     const prev = existing[id]
