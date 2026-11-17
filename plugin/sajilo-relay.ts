@@ -109,7 +109,7 @@ const PORT = Number(env("RELAY_PORT") ?? 43915)
 // A build marker. The doctor reads it to tell which relay wrote the log, and
 // judges only what THIS build did - the log also holds the history of
 // earlier builds, and an old rotation must not fail today's check.
-const BUILD = "json-mode-2026-11-18.2"
+const BUILD = "json-mode-2026-11-18.3"
 // Where the relay listens. 127.0.0.1 keeps it on this machine (other local
 // agents can still use it). Set it to 0.0.0.0 to serve other machines - but
 // then a token is REQUIRED, because the relay spends the account's quota.
@@ -2325,6 +2325,25 @@ let hits = 0
 let takeoverTimer: ReturnType<typeof setInterval> | null = null
 let watchdogTimer: ReturnType<typeof setInterval> | null = null
 
+// The watchdog interval of ANY build of this plugin in this process. A reload
+// evaluates this module again, so module state cannot see the timer the
+// previous build left running - and that interval keeps spawning probes for
+// the life of the process. Three builds were probing every three minutes at
+// once, and two of the lines in the log were verdicts of code that was no
+// longer loaded. globalThis survives the reload, so the new instance takes the
+// old timer over instead of adding another.
+const WATCHDOG_SLOT = "__sajiloRelayWatchdogTimer"
+
+function stopWatchdog(): void {
+  if (!watchdogTimer) return
+  clearInterval(watchdogTimer)
+  const g = globalThis as Record<string, unknown>
+  // Only drop the slot if it still points at OUR timer: an instance being
+  // unloaded must not cancel the one its replacement has just started.
+  if (g[WATCHDOG_SLOT] === watchdogTimer) delete g[WATCHDOG_SLOT]
+  watchdogTimer = null
+}
+
 /**
  * A timer handle is a number under the DOM lib and a Timeout object under
  * Bun/Node. The only thing we want from it is the optional unref - so the
@@ -3584,6 +3603,13 @@ function readModelPin(): string {
 function startWatchdog(): void {
   if (watchdogTimer) return
   if (env("RELAY_WATCHDOG") === "0") return
+  // Take over the timer a previous build of this plugin left behind, so a
+  // reload replaces the watchdog instead of adding a second one.
+  const watchdogSlot = globalThis as Record<string, unknown>
+  const previousWatchdog = watchdogSlot[WATCHDOG_SLOT] as
+    | ReturnType<typeof setInterval>
+    | undefined
+  if (previousWatchdog) clearInterval(previousWatchdog)
   // The watchdog keeps the egress alive. On unix that is the usque tunnel
   // watchdog; on Windows the opencode-warp stack ships probe.cmd, which checks
   // the WARP egress the same way. Pointing it at the unix path here meant the
@@ -3658,6 +3684,7 @@ function startWatchdog(): void {
   // every 3 minutes for the life of the server.
   void Bun.sleep(90_000).then(watchdogTick)
   watchdogTimer = setInterval(watchdogTick, 3 * 60_000)
+  watchdogSlot[WATCHDOG_SLOT] = watchdogTimer
   unrefTimer(watchdogTimer)
 }
 
@@ -3820,6 +3847,9 @@ export async function startRelay(): Promise<(() => Promise<void>) | undefined> {
         clearInterval(takeoverTimer)
         takeoverTimer = null
       }
+      // The watchdog is the one timer that used to outlive its build: it was
+      // never cleared here, so every reload left another probe running.
+      stopWatchdog()
     }
   }
 }
