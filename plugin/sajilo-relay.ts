@@ -109,7 +109,7 @@ const PORT = Number(env("RELAY_PORT") ?? 43915)
 // A build marker. The doctor reads it to tell which relay wrote the log, and
 // judges only what THIS build did - the log also holds the history of
 // earlier builds, and an old rotation must not fail today's check.
-const BUILD = "json-mode-2026-11-18.1"
+const BUILD = "json-mode-2026-11-18.2"
 // Where the relay listens. 127.0.0.1 keeps it on this machine (other local
 // agents can still use it). Set it to 0.0.0.0 to serve other machines - but
 // then a token is REQUIRED, because the relay spends the account's quota.
@@ -3637,11 +3637,13 @@ function startWatchdog(): void {
             logActivity(`[${new Date().toISOString()}] WATCHDOG repair attempted rc=${rc}`)
             return
           }
-          // probe.cmd's exit codes: 1 throttled, 2 no verdict, 3 transport.
-          // It only reports - it never rotates, so say what it saw, without
-          // implying a repair happened.
-          const reason =
-            rc === 1 ? "throttled" : rc === 2 ? "no verdict" : rc === 3 ? "transport failure" : "failed"
+          // probe.cmd: 0 ok, 1 throttled, 2 no verdict, 3 transport failure.
+          // A throttled ACCOUNT is not an egress fault - the relay's own 429
+          // handling reports it, and logging it here every three minutes is
+          // how the log filled with lines that meant nothing. So only 2 and 3
+          // get a line: a WATCHDOG line now means the egress is suspect.
+          if (rc === 1) return
+          const reason = rc === 2 ? "no verdict" : rc === 3 ? "transport failure" : "failed"
           logActivity(
             `[${new Date().toISOString()}] WATCHDOG probe via 127.0.0.1:${probePort || "40000"} exited rc=${rc} (${reason})`,
           )
