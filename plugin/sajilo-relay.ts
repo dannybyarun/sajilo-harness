@@ -109,7 +109,7 @@ const PORT = Number(env("RELAY_PORT") ?? 43915)
 // A build marker. The doctor reads it to tell which relay wrote the log, and
 // judges only what THIS build did - the log also holds the history of
 // earlier builds, and an old rotation must not fail today's check.
-const BUILD = "json-mode-2026-11-17.4"
+const BUILD = "json-mode-2026-11-18.1"
 // Where the relay listens. 127.0.0.1 keeps it on this machine (other local
 // agents can still use it). Set it to 0.0.0.0 to serve other machines - but
 // then a token is REQUIRED, because the relay spends the account's quota.
@@ -335,10 +335,6 @@ export const SAJILO_MODEL_LIST: ModelList = {
   "nemotron-3.5-lightning-free": {
     name: "Nemotron 3.5 Lightning",
     limit: { context: 262_144, output: 262_144 },
-  },
-  "minimax-m3.1-flash-free": {
-    name: "MiniMax M3.1 Flash",
-    limit: { context: 1_000_000, output: 512_000 },
   },
   "nemotron-3.5-super-vl-free": {
     name: "Nemotron 3.5 Super VL",
@@ -1495,7 +1491,7 @@ function startReset(reason: string, leg?: Egress): Promise<ResetResult> {
  * the choice is between a good answer and no answer.
  */
 const STRONG_POOL = [
-  "minimax-m3.1-flash-free",
+  "glm-5.3-flash-free",
   "deepseek-v4.1-flash-free",
   "mimo-v2.6-flash-free",
 ]
@@ -3604,6 +3600,15 @@ function startWatchdog(): void {
     return
   }
   let watchdogBusy = false
+  // probe.ps1 takes its target from the ENVIRONMENT, not from argv: PROXY and
+  // WARP_PROXY_PORT. With neither set it dials 127.0.0.1:40000, and this stack
+  // does not use 40000 (the tunnels are 40005 and up, the direct leg is 40001).
+  // So every tick probed a port nobody listens on and reported rc=3
+  // ("transport failure through WARP") - the watchdog was never actually
+  // looking at the tunnel it is meant to watch, and 166 false alarms in a day
+  // hid any real one. Point it at the leg the relay itself is using.
+  const probeProxy = isWindows ? (env("RELAY_PROXY") ?? "") : ""
+  const probePort = /:(\d+)\/?$/.exec(probeProxy)?.[1] ?? ""
   const watchdogTick = () => {
     if (watchdogBusy) return
     watchdogBusy = true
@@ -3613,6 +3618,11 @@ function startWatchdog(): void {
             stdout: "ignore",
             stderr: "ignore",
             stdin: "ignore",
+            env: {
+              ...process.env,
+              ...(probeProxy ? { PROXY: probeProxy } : {}),
+              ...(probePort ? { WARP_PROXY_PORT: probePort } : {}),
+            },
           })
         : Bun.spawn(["bash", WATCHDOG], {
             stdout: "ignore",
@@ -3622,9 +3632,19 @@ function startWatchdog(): void {
       proc.unref()
       proc.exited
         .then((rc: number) => {
-          if (rc !== 0) {
+          if (rc === 0) return
+          if (!isWindows) {
             logActivity(`[${new Date().toISOString()}] WATCHDOG repair attempted rc=${rc}`)
+            return
           }
+          // probe.cmd's exit codes: 1 throttled, 2 no verdict, 3 transport.
+          // It only reports - it never rotates, so say what it saw, without
+          // implying a repair happened.
+          const reason =
+            rc === 1 ? "throttled" : rc === 2 ? "no verdict" : rc === 3 ? "transport failure" : "failed"
+          logActivity(
+            `[${new Date().toISOString()}] WATCHDOG probe via 127.0.0.1:${probePort || "40000"} exited rc=${rc} (${reason})`,
+          )
         })
         .catch(() => {})
     } catch (e) {
