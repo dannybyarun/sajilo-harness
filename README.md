@@ -608,6 +608,43 @@ The gateway's own clock says how long a drained bucket stays quarantined, so
 the relay stops using a leg exactly as long as the gateway says that bucket
 is empty.
 
+### A wedged leg repairs itself
+
+A tunnel can fail without failing: `usque` stays connected, the port keeps
+listening and the tunnel still reports a MASQUE session - and every request
+through it times out anyway, because its TUN reader is parked. The ladder hides
+it: the request climbs past the dead leg and answers 200, so the only trace was
+one `SPIN fetch-error` per request and a `WATCHDOG ... no verdict` line every
+three minutes - and nothing ever repaired it. It cost a timeout on **every**
+request until somebody rotated the slot by hand.
+
+So the working legs are watched too, with the same zero-token trace request the
+reserve already used: once per watchdog tick (three minutes), and on the
+request path itself, so a leg is judged at the rate it is used. Two failures
+**in a row** rotate that leg's slot:
+
+```
+EGRESS-DOWN the proxy egress (http://127.0.0.1:40005) failed 2 times in a row (TimeoutError: ...) - rotating its slot
+EGRESS-REPAIRED the proxy egress answers again
+```
+
+Three rules keep it from over-reacting. A rotation gets a one-minute warmup
+before its leg is judged again, so the downtime it asked for is not read as a
+fault. A leg still down after a repair waits out a ten-minute cooldown instead
+of burning registrations - each one is a new exit IP, and Cloudflare rate-limits
+them - and says so once (`EGRESS-STUCK`). And a leg that **answers** but is not
+WARP (`warp=off`) counts as alive: rotating its slot could not change that, so
+counting it as a fault would rotate a good leg once per cooldown, forever.
+
+The reserve is repaired by the same rule, so a wedge cannot leave the session
+without a spare. `/relay-health` reports the last probe of every working leg:
+
+```
+leg   slot failures ok   ip                          warp
+proxy    0        0 True 2a09:bac5:4e7b:16b4::243:af True
+alt      1        0 True 2a09:bac5:4e7c:1a46::29e:3f True
+```
+
 | knob | effect |
 |---|---|
 | `SAJILO_TUNNEL_SLOTS` | how many tunnels this instance runs (default 1) |

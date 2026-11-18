@@ -109,7 +109,7 @@ const PORT = Number(env("RELAY_PORT") ?? 43915)
 // A build marker. The doctor reads it to tell which relay wrote the log, and
 // judges only what THIS build did - the log also holds the history of
 // earlier builds, and an old rotation must not fail today's check.
-const BUILD = "json-mode-2026-11-18.6"
+const BUILD = "json-mode-2026-11-18.7"
 // Where the relay listens. 127.0.0.1 keeps it on this machine (other local
 // agents can still use it). Set it to 0.0.0.0 to serve other machines - but
 // then a token is REQUIRED, because the relay spends the account's quota.
@@ -1318,6 +1318,11 @@ function rotateLeg(leg: Egress, reason: string): Promise<boolean> {
   const p = rotationChain.then(async () => {
     const wasSpent = spentLegs.has(leg)
     const ok = await performEgressRotation(reason, leg)
+    // ANY rotation - a refill after a 429 or a repair after a wedge - leaves
+    // the leg with a tunnel that is still coming up. The clock starts when the
+    // rotator finishes, so the probes in that window are not read as faults
+    // (and cannot bounce the leg into a second rotation).
+    legRepairedAt.set(leg, Date.now())
     // A landed rotation is a new exit IP, so the bucket is fresh again.
     if (ok) {
       spentLegs.delete(leg)
@@ -1881,6 +1886,11 @@ async function checkReserve(attempts = 1): Promise<void> {
           `[${new Date().toISOString()}] RESERVE probe ${where} FAILED (${seen.error}) - the backup leg cannot serve, and the next drain has no spare`,
         )
       }
+      // The spare is a leg like any other: a spare that cannot answer is not a
+      // spare. Repair it with the working legs' rule - but only for a fault a
+      // rotation can fix. warp=off means it DID answer and is simply not a WARP
+      // exit, and rotating the slot would not change that.
+      if (!legAnswered(seen)) legDown(leg, seen.error ?? "probe failed")
       return
     }
     if (before === undefined) {
@@ -1892,8 +1902,182 @@ async function checkReserve(attempts = 1): Promise<void> {
         `[${new Date().toISOString()}] RESERVE probe ${where} ok again: exits ${seen.ip} warp=on`,
       )
     }
+    legUp(leg)
   } finally {
     reserveProbeBusy = false
+  }
+}
+
+/**
+ * The working legs are the ones nobody watches.
+ *
+ * The reserve has a probe of its own; the legs the ladder actually rides are
+ * taken on trust until a request pays for them. When one wedges, that trust is
+ * expensive: usque can stay "connected" with its TUN reader parked, so the
+ * process is alive, the port is listening and the tunnel still reports a
+ * MASQUE session - and every request through it times out anyway. The only
+ * trace is a SPIN fetch-error per request (which does not name a leg as broken,
+ * because the request succeeds on the next rung) and a WATCHDOG line every
+ * three minutes. Nothing said which leg, and nothing repaired it: the failure
+ * was permanent, invisible from outside, and cost one timeout on every request
+ * until somebody rotated the slot by hand.
+ *
+ * This is the missing half of the ladder: the same zero-token trace the
+ * reserve probe uses, aimed at every leg this instance owns, so a wedged
+ * tunnel is found when nothing else is asking for it and rotated without
+ * anyone watching.
+ */
+const LEG_WARMUP_MS = 60_000
+const LEG_REPAIR_COOLDOWN_MS = 10 * 60_000
+const LEG_FAILURES_BEFORE_REPAIR = 2
+
+const legFailures = new Map<Egress, number>()
+const legRepairedAt = new Map<Egress, number>()
+const legProbe = new Map<Egress, LegProbe & { at: number }>()
+const legStuckLogged = new Set<Egress>()
+let legProbeBusy = false
+// The relay cannot know what happened to the tunnels before it started, and it
+// is often started while they are still connecting. Nothing is judged in the
+// first minute, so a slow boot is not mistaken for a dead leg.
+const RELAY_STARTED_AT = Date.now()
+
+export type LegRepairState = "warming" | "counting" | "cooldown" | "due"
+
+/**
+ * When is a working leg declared dead? Pure, and exported, because the answer
+ * is a policy and a policy that is not tested drifts.
+ *
+ * - "warming": a rotation took this leg down on purpose, so a probe in that
+ *   window says nothing about the leg and must not count towards a repair.
+ * - "counting": one failure is a blip - a connection can be lost for reasons
+ *   that have nothing to do with the tunnel - so it takes two in a row.
+ * - "cooldown": it was rotated recently and is still down. Two repairs inside
+ *   the cooldown would churn registrations (each one is a new exit IP, and
+ *   Cloudflare rate-limits them) for a fault that is evidently not the
+ *   registration.
+ * - "due": rotate the slot.
+ */
+export function legRepairState(
+  failures: number,
+  msSinceRepair: number,
+  threshold = LEG_FAILURES_BEFORE_REPAIR,
+  warmupMs = LEG_WARMUP_MS,
+  cooldownMs = LEG_REPAIR_COOLDOWN_MS,
+): LegRepairState {
+  if (msSinceRepair < warmupMs) return "warming"
+  if (failures < threshold) return "counting"
+  if (msSinceRepair < cooldownMs) return "cooldown"
+  return "due"
+}
+
+/**
+ * The legs this instance can repair by rotating: the shared app and the
+ * device's own egress are not ours to move, and the reserve is already probed
+ * by checkReserve().
+ */
+function repairableLegs(): EgressLeg[] {
+  const reserve = currentReserve()
+  return egressLegs().filter((l) => l.owned && !l.reserve && l.name !== reserve)
+}
+
+function legDown(leg: Egress, error: string): void {
+  // A rotation is restarting this very leg - its downtime is the repair.
+  if (pendingRotations.has(leg)) return
+  // Give a fresh relay a minute to see the tunnels come up before it calls one
+  // of them dead.
+  if (Date.now() - RELAY_STARTED_AT < LEG_WARMUP_MS) return
+  const failures = (legFailures.get(leg) ?? 0) + 1
+  legFailures.set(leg, failures)
+  const since = Date.now() - (legRepairedAt.get(leg) ?? -Infinity)
+  const state = legRepairState(failures, since)
+  if (state === "warming") {
+    legFailures.delete(leg)
+    return
+  }
+  if (state === "counting") return
+  const where = egressLegByName(leg)?.proxy ?? leg
+  if (state === "cooldown") {
+    // One line per stuck episode, not one per probe.
+    if (legStuckLogged.has(leg)) return
+    legStuckLogged.add(leg)
+    logActivity(
+      `[${new Date().toISOString()}] EGRESS-STUCK the ${leg} egress (${where}) is still down after a repair (${error}) - ` +
+        `not rotating it again for ${Math.round((LEG_REPAIR_COOLDOWN_MS - since) / 60_000)}m`,
+    )
+    return
+  }
+  legFailures.delete(leg)
+  legStuckLogged.delete(leg)
+  if (!egressRotationEnabled()) {
+    logActivity(
+      `[${new Date().toISOString()}] EGRESS-DOWN the ${leg} egress (${where}) failed ${failures} times in a row (${error}) - ` +
+        `rotation is disabled, not repairing`,
+    )
+    return
+  }
+  logActivity(
+    `[${new Date().toISOString()}] EGRESS-DOWN the ${leg} egress (${where}) failed ${failures} times in a row (${error}) - ` +
+      `rotating its slot`,
+  )
+  void rotateLeg(leg, `repair-${leg}`)
+}
+
+function legUp(leg: Egress): void {
+  const wasDown = legFailures.delete(leg)
+  legStuckLogged.delete(leg)
+  if (!wasDown) return
+  logActivity(
+    `[${new Date().toISOString()}] EGRESS-REPAIRED the ${leg} egress answers again`,
+  )
+}
+
+// Fed by the request path, so a leg that is being used is watched at the rate
+// it is used - that is what catches a wedge in under a minute, without waiting
+// for the next tick.
+function noteLegServed(leg: Egress): void {
+  if (leg === "direct") return
+  legUp(leg)
+}
+
+function noteLegDown(leg: Egress, error: string): void {
+  if (leg === "direct") return
+  legDown(leg, error)
+}
+
+/**
+ * Did the leg ANSWER? That is the question for a working leg - not "is it a
+ * WARP exit".
+ *
+ * probeLeg() is strict on purpose: the reserve has to be a distinct bucket, so
+ * warp=off disqualifies it. A working leg is different. If the trace came back
+ * with warp=off, the tunnel passed traffic and the exit is simply not WARP -
+ * a configuration fact that rotating the slot cannot change. Counting it as a
+ * fault would rotate a perfectly good leg once per cooldown, forever.
+ */
+export function legAnswered(seen: LegProbe): boolean {
+  // warp === false means the trace parsed and said "off": it answered.
+  return seen.ok || seen.warp === false
+}
+
+/**
+ * Probe every working leg. Called on the watchdog tick, so a wedged tunnel is
+ * found even when nothing is being asked of it. The probe is a trace GET and
+ * spends no model quota, so a healthy machine pays one small request per leg
+ * every three minutes.
+ */
+async function checkWorkingLegs(timeoutMs = 6_000): Promise<void> {
+  if (legProbeBusy) return
+  legProbeBusy = true
+  try {
+    for (const leg of repairableLegs()) {
+      if (pendingRotations.has(leg.name)) continue
+      const seen = await probeLeg(leg.name, timeoutMs)
+      legProbe.set(leg.name, { ...seen, at: Date.now() })
+      if (legAnswered(seen)) legUp(leg.name)
+      else legDown(leg.name, seen.error ?? "probe failed")
+    }
+  } finally {
+    legProbeBusy = false
   }
 }
 
@@ -2595,6 +2779,25 @@ function startServer(): void {
               spent: isLegSpent(l.name),
               spentUntil: spentLegs.get(l.name) ?? null,
             })),
+            // The working legs, watched: the last trace probe through each one
+            // and how many times in a row it has lost. This is the answer to
+            // "is the primary actually passing traffic", which is otherwise
+            // only visible as one SPIN fetch-error per request.
+            legHealth: repairableLegs().map((l) => {
+              const p = legProbe.get(l.name)
+              return {
+                leg: l.name,
+                proxy: l.proxy,
+                slot: l.slot,
+                failures: legFailures.get(l.name) ?? 0,
+                repairedAt: legRepairedAt.get(l.name) ?? null,
+                ok: p?.ok ?? null,
+                ip: p?.ip ?? null,
+                warp: p?.warp ?? null,
+                error: p?.error ?? null,
+                ageSeconds: p ? Math.round((Date.now() - p.at) / 1000) : null,
+              }
+            }),
             // The tunnels that are being refilled right now (a new WARP
             // account, a new exit IP, a fresh bucket).
             refilling: [...pendingRotations.keys()],
@@ -2975,6 +3178,10 @@ function startServer(): void {
                   },
                   egress,
                 )
+                // An answer - any answer - proves this leg carries traffic. A
+                // 429 is a drained bucket, not a broken tunnel, so it must not
+                // count towards a repair.
+                noteLegServed(egress)
                 // A 429 from a proxied leg means THAT BUCKET is drained - not
                 // that the model is. The next leg is a different exit IP (its
                 // own bucket) and can still have room, so keep climbing the
@@ -3010,6 +3217,9 @@ function startServer(): void {
                 finalErrBody = String(e).slice(0, 300)
                 if (egress !== "direct") {
                   // This proxy leg failed - fall through to the next leg.
+                  // Count it: a leg that fails on real traffic is exactly the
+                  // suspicion the probe confirms before a slot is rotated.
+                  noteLegDown(egress, finalErrBody)
                   logActivity(
                     `[${new Date().toISOString()}] SPIN fetch-error via the ${egress} egress (${wanted}): ${finalErrBody} - trying the next egress`,
                   )
@@ -3794,6 +4004,10 @@ function startWatchdog(): void {
     // spends no model quota - so "the backup works" is re-established every
     // three minutes instead of assumed until the day it is needed.
     void checkReserve()
+    // ...and so are the legs the ladder actually rides. A wedged tunnel used
+    // to be found only by the request that paid a timeout for it, and repaired
+    // only by hand.
+    void checkWorkingLegs()
     if (!probePresent) return
     if (watchdogBusy) return
     watchdogBusy = true
@@ -3849,6 +4063,9 @@ function startWatchdog(): void {
   // seconds instead of after the first grace period. Two attempts: a tunnel
   // that is still connecting reads warp=off on the first one.
   void checkReserve(2)
+  // The working legs get the same first look, for the same reason - and the
+  // answer is on /relay-health even before the first tick.
+  void checkWorkingLegs()
 }
 
 /**
